@@ -1,0 +1,86 @@
+---
+title: "Introduction"
+description: "A production-ready Spring Boot 3.4 / Java 21 microservices ecosystem with service discovery, JWT authentication, hexagonal architecture, event-driven messaging, distributed tracing, and centralized logging."
+---
+
+## What is Microservicios Ecosystem?
+
+This is a reference implementation of a cloud-native microservices architecture built with **Spring Boot 3.4**, **Java 21**, and **Maven Multi-Module**. It demonstrates industry-standard patterns including hexagonal architecture, event-driven communication, and full observability out of the box.
+
+The entire ecosystem can be launched with a single Docker Compose command.
+
+## Architecture at a glance
+
+The ecosystem is composed of six Spring Boot services and a supporting infrastructure layer:
+
+| Service | Port | Role |
+|---------|------|------|
+| `config-server` | 8888 | Centralized configuration (filesystem) |
+| `eureka-server` | 8761 | Service discovery (Netflix Eureka) |
+| `auth-service` | 8083 | JWT authentication (BCrypt, H2) |
+| `api-gateway` | 8080 | Routing, JWT validation (Spring Cloud Gateway) |
+| `inventory-service` | 8082 | Business domain — hexagonal architecture (H2) |
+| `notification-service` | 8084 | Event consumer (RabbitMQ or Kafka) |
+
+Supporting infrastructure:
+
+| Component | Port | Role |
+|-----------|------|------|
+| RabbitMQ | 5672 / 15672 | Message broker option 1 |
+| Apache Kafka | 9092 | Message broker option 2 (KRaft) |
+| Zipkin | 9411 | Distributed tracing UI |
+| Elasticsearch | 9200 | Log storage and search |
+| Logstash | 5044 | Log collection and parsing |
+| Kibana | 5601 | Log visualization UI |
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Docker Compose deployment" icon="docker">
+    Launch the full ecosystem with a single command. Choose RabbitMQ or Kafka via profiles.
+  </Card>
+  <Card title="Hexagonal architecture" icon="hexagon">
+    The inventory service demonstrates Ports & Adapters, decoupling domain from infrastructure.
+  </Card>
+  <Card title="JWT security" icon="lock">
+    BCrypt password hashing, HS384 JWT tokens, and OAuth2 Resource Server validation at the gateway.
+  </Card>
+  <Card title="Event-driven messaging" icon="bolt">
+    Switch between RabbitMQ and Apache Kafka at runtime using Spring Profiles — no code changes needed.
+  </Card>
+  <Card title="Distributed tracing" icon="chart-network">
+    Micrometer + Brave + Zipkin: trace requests across all services with correlated IDs.
+  </Card>
+  <Card title="Centralized logging" icon="magnifying-glass">
+    ELK stack (Elasticsearch + Logstash + Kibana) aggregates logs from all services with traceId correlation.
+  </Card>
+</CardGroup>
+
+## Quick navigation
+
+<CardGroup cols={2}>
+  <Card title="Docker quickstart" icon="rocket" href="/quickstart-docker">
+    Get the full ecosystem running in minutes with Docker Compose.
+  </Card>
+  <Card title="Manual quickstart" icon="terminal" href="/quickstart-manual">
+    Run natively without Docker to save memory.
+  </Card>
+  <Card title="Architecture overview" icon="sitemap" href="/architecture/overview">
+    Understand how all services interact.
+  </Card>
+  <Card title="API reference" icon="code" href="/operations/api-reference">
+    Explore all available endpoints.
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+Before you begin, make sure you have the following installed:
+
+- **Java 21** — Required to build and run all Spring Boot services
+- **Maven 3.9+** — Multi-module build system
+- **Docker Desktop** — Required for the Docker Compose deployment path
+
+<Tip>
+  For the Docker path, Docker Desktop must be fully running (not "starting...") before executing any `docker compose` commands.
+</Tip>

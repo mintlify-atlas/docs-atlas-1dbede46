@@ -1,0 +1,346 @@
+---
+title: "Notification Service"
+description: "Event consumer microservice that listens for ProductCreatedEvent from RabbitMQ or Apache Kafka and logs notifications."
+---
+
+The notification service is an event-driven consumer. It does not expose any REST API — its sole responsibility is to listen for `ProductCreatedEvent` messages published by the inventory service and log a notification for each one.
+
+<CardGroup cols={3}>
+  <Card title="Port" icon="plug">
+    `8084`
+  </Card>
+  <Card title="Broker options" icon="arrows-left-right">
+    RabbitMQ or Kafka
+  </Card>
+  <Card title="Profile required" icon="sliders">
+    `rabbitmq` or `kafka`
+  </Card>
+</CardGroup>
+
+## How it works
+
+When a product is created in the inventory service, the following sequence occurs:
+
+<Steps>
+  <Step title="Product created">
+    A `POST /api/inventory/products` request is handled by `InventoryController`. `ProductService` saves the product and publishes a `ProductCreatedEvent` via `EventPublisherPort`.
+  </Step>
+  <Step title="Event routed to broker">
+    The active messaging adapter (RabbitMQ or Kafka, depending on the Spring profile) delivers the event to the configured exchange/queue or topic.
+  </Step>
+  <Step title="Notification service receives event">
+    The listener in notification-service deserializes the `ProductCreatedEvent` and logs the notification to standard output.
+  </Step>
+</Steps>
+
+## Event format
+
+Both broker listeners deserialize the same `ProductCreatedEvent` DTO:
+
+```java ProductCreatedEvent.java
+public class ProductCreatedEvent {
+    private Long productId;
+    private String name;
+    private Integer quantity;
+    private Double price;
+    private Instant timestamp;
+
+    // getters and setters
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `productId` | `Long` | ID of the created product |
+| `name` | `String` | Product name |
+| `quantity` | `Integer` | Stock quantity |
+| `price` | `Double` | Unit price |
+| `timestamp` | `Instant` | Time the event was created |
+
+## Spring profiles
+
+The active profile determines which listener and configuration are loaded. No code changes are required to switch brokers — only the profile needs to change.
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    # Docker
+    docker compose --profile rabbitmq up --build
+
+    # Manual
+    cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+    ```
+  </Tab>
+  <Tab title="Kafka">
+    ```bash
+    # Docker
+    docker compose --profile kafka up --build
+
+    # Manual
+    cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The notification service must use the same profile as the inventory service. Both must be configured to use the same broker at the same time.
+</Note>
+
+## RabbitMQ configuration
+
+Active when `spring.profiles.active=rabbitmq`. `RabbitMQConfig` declares the exchange, queue, and binding:
+
+```java RabbitMQConfig.java
+@Configuration
+@Profile("rabbitmq")
+public class RabbitMQConfig {
+
+    public static final String EXCHANGE    = "inventory.exchange";
+    public static final String QUEUE       = "product.created.queue";
+    public static final String ROUTING_KEY = "product.created";
+
+    @Bean
+    public TopicExchange inventoryExchange() {
+        return new TopicExchange(EXCHANGE);
+    }
+
+    @Bean
+    public Queue productCreatedQueue() {
+        return QueueBuilder.durable(QUEUE).build();
+    }
+
+    @Bean
+    public Binding productCreatedBinding(Queue productCreatedQueue, TopicExchange inventoryExchange) {
+        return BindingBuilder.bind(productCreatedQueue).to(inventoryExchange).with(ROUTING_KEY);
+    }
+
+    @Bean
+    public MessageConverter jsonMessageConverter() {
+        return new Jackson2JsonMessageConverter();
+    }
+}
+```
+
+| Setting | Value |
+|---------|-------|
+| Exchange | `inventory.exchange` (TopicExchange) |
+| Queue | `product.created.queue` (durable) |
+| Routing key | `product.created` |
+| Message format | JSON via `Jackson2JsonMessageConverter` |
+
+### RabbitMQ listener
+
+```java ProductEventListener.java
+@Component
+@Profile("rabbitmq")
+public class ProductEventListener {
+
+    @RabbitListener(queues = "product.created.queue")
+    public void handleProductCreated(ProductCreatedEvent event) {
+        log.info("=== NOTIFICACIÓN RECIBIDA ===");
+        log.info("Nuevo producto creado:");
+        log.info("  ID:       {}", event.getProductId());
+        log.info("  Nombre:   {}", event.getName());
+        log.info("  Cantidad: {}", event.getQuantity());
+        log.info("  Precio:   ${}", event.getPrice());
+        log.info("  Fecha:    {}", event.getTimestamp());
+        log.info("=============================");
+    }
+}
+```
+
+### Connection settings (application-rabbitmq.yml)
+
+```yaml application-rabbitmq.yml
+spring:
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+```
+
+In the Docker setup, `SPRING_RABBITMQ_HOST` is overridden to `rabbitmq` (the container name).
+
+## Kafka configuration
+
+Active when `spring.profiles.active=kafka`. `KafkaConfig` sets up the consumer factory:
+
+```java KafkaConfig.java
+@Configuration
+@Profile("kafka")
+public class KafkaConfig {
+
+    public static final String TOPIC = "product-created";
+
+    @Value("${spring.kafka.bootstrap-servers:localhost:9092}")
+    private String bootstrapServers;
+
+    @Bean
+    public ConsumerFactory<String, ProductCreatedEvent> consumerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        config.put(ConsumerConfig.GROUP_ID_CONFIG, "notification-group");
+        config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        config.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        return new DefaultKafkaConsumerFactory<>(config);
+    }
+}
+```
+
+| Setting | Value |
+|---------|-------|
+| Topic | `product-created` |
+| Group ID | `notification-group` |
+| Offset reset | `earliest` |
+| Value deserializer | `JsonDeserializer<ProductCreatedEvent>` |
+
+### Kafka listener
+
+```java KafkaProductEventListener.java
+@Component
+@Profile("kafka")
+public class KafkaProductEventListener {
+
+    @KafkaListener(topics = "product-created", groupId = "notification-group")
+    public void handleProductCreated(ProductCreatedEvent event) {
+        log.info("=== NOTIFICACIÓN RECIBIDA (Kafka) ===");
+        log.info("Nuevo producto creado:");
+        log.info("  ID:       {}", event.getProductId());
+        log.info("  Nombre:   {}", event.getName());
+        log.info("  Cantidad: {}", event.getQuantity());
+        log.info("  Precio:   ${}", event.getPrice());
+        log.info("  Fecha:    {}", event.getTimestamp());
+        log.info("=====================================");
+    }
+}
+```
+
+### Connection settings (application-kafka.yml)
+
+```yaml application-kafka.yml
+spring:
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.amqp.RabbitAutoConfiguration
+  kafka:
+    bootstrap-servers: localhost:9092
+```
+
+In the Docker setup, `SPRING_KAFKA_BOOTSTRAP_SERVERS` is overridden to `kafka:9092`.
+
+## Expected log output
+
+When a product is created, the notification service logs the following to its console:
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```
+    === NOTIFICACIÓN RECIBIDA ===
+    Nuevo producto creado:
+      ID:       4
+      Nombre:   Monitor
+      Cantidad: 15
+      Precio:   $299.99
+      Fecha:    2026-03-15T12:00:00Z
+    =============================
+    ```
+  </Tab>
+  <Tab title="Kafka">
+    ```
+    === NOTIFICACIÓN RECIBIDA (Kafka) ===
+    Nuevo producto creado:
+      ID:       4
+      Nombre:   Monitor
+      Cantidad: 15
+      Precio:   $299.99
+      Fecha:    2026-03-15T12:00:00Z
+    =====================================
+    ```
+  </Tab>
+</Tabs>
+
+## How to verify it's working
+
+<Steps>
+  <Step title="Start the stack with a broker profile">
+    ```bash
+    docker compose --profile rabbitmq up --build
+    ```
+  </Step>
+  <Step title="Obtain a JWT">
+    ```bash
+    TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+    ```
+  </Step>
+  <Step title="Create a product">
+    ```bash
+    curl -X POST http://localhost:8080/api/inventory/products \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"name":"Monitor","quantity":15,"price":299.99}'
+    ```
+  </Step>
+  <Step title="Check notification-service logs">
+    ```bash
+    # Docker
+    docker logs <notification-service-container> --follow
+    ```
+
+    You should see the `=== NOTIFICACIÓN RECIBIDA ===` block printed within a second of creating the product.
+  </Step>
+</Steps>
+
+## Switching brokers
+
+To switch from RabbitMQ to Kafka (or vice versa), change the Docker Compose profile. No code changes are needed:
+
+```bash
+# Stop current stack
+docker compose --profile rabbitmq down
+
+# Start with Kafka instead
+docker compose --profile kafka up --build
+```
+
+The `SPRING_PROFILES_ACTIVE` environment variable in `docker-compose.yml` controls which Spring profile — and therefore which listener and configuration beans — are loaded in both `inventory-service` and `notification-service`.
+
+## Environment variables
+
+<Tabs>
+  <Tab title="RabbitMQ profile">
+    | Variable | Value | Description |
+    |----------|-------|-------------|
+    | `SPRING_PROFILES_ACTIVE` | `rabbitmq` | Activates the RabbitMQ listener |
+    | `SPRING_RABBITMQ_HOST` | `rabbitmq` | Hostname of the RabbitMQ container |
+    | `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` | `http://eureka-server:8761/eureka/` | Service discovery endpoint |
+    | `EUREKA_INSTANCE_PREFER_IP_ADDRESS` | `true` | Registers with IP instead of hostname |
+    | `MANAGEMENT_ZIPKIN_TRACING_ENDPOINT` | `http://zipkin:9411/api/v2/spans` | Distributed tracing endpoint |
+  </Tab>
+  <Tab title="Kafka profile">
+    | Variable | Value | Description |
+    |----------|-------|-------------|
+    | `SPRING_PROFILES_ACTIVE` | `kafka` | Activates the Kafka listener |
+    | `SPRING_KAFKA_BOOTSTRAP_SERVERS` | `kafka:9092` | Kafka broker address |
+    | `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` | `http://eureka-server:8761/eureka/` | Service discovery endpoint |
+    | `EUREKA_INSTANCE_PREFER_IP_ADDRESS` | `true` | Registers with IP instead of hostname |
+    | `MANAGEMENT_ZIPKIN_TRACING_ENDPOINT` | `http://zipkin:9411/api/v2/spans` | Distributed tracing endpoint |
+  </Tab>
+</Tabs>
+
+## Health check
+
+```bash
+curl http://localhost:8084/actuator/health
+```
+
+Expected response:
+
+```json
+{ "status": "UP" }
+```

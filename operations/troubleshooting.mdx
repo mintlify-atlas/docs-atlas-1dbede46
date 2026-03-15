@@ -1,0 +1,233 @@
+---
+title: "Troubleshooting"
+description: "Common issues and solutions when running the microservices ecosystem."
+---
+
+<AccordionGroup>
+
+  <Accordion title="Config Server fails to start / 'Invalid config server configuration'">
+
+    **Cause:** The Config Server defaults to the `git` profile, which requires a configured Git repository. When no repository is set, Spring Boot throws `Invalid config server configuration`.
+
+    **Fix:** Always start the Config Server with the `native` profile, which reads configuration files from the local `config/` directory:
+
+    ```bash
+    cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+    ```
+
+    When running with Docker Compose, the profile is already set via the environment variable:
+
+    ```yaml docker-compose.yml
+    config-server:
+      environment:
+        SPRING_PROFILES_ACTIVE: native
+    ```
+
+    <Warning>
+      All other Spring Boot services depend on the Config Server being healthy before they start. If the Config Server fails, none of the downstream services will boot correctly.
+    </Warning>
+
+  </Accordion>
+
+  <Accordion title="Services not appearing in Eureka">
+
+    1. Verify the Eureka server itself is running at `http://localhost:8761`.
+
+    2. Check that each service has the correct `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` value:
+
+       ```yaml
+       EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+       ```
+
+       When running manually (not in Docker), use `localhost` instead of `eureka-server`:
+
+       ```yaml
+       EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://localhost:8761/eureka/
+       ```
+
+    3. Confirm that registered services appear in the registry:
+
+       ```bash
+       curl http://localhost:8761/eureka/apps
+       ```
+
+    4. The API Gateway must start **after** the services it routes to are registered in Eureka. Start it last.
+
+  </Accordion>
+
+  <Accordion title="401 Unauthorized on protected endpoints">
+
+    Work through this checklist:
+
+    1. **Did you obtain a token?** Call `POST /auth/login` first:
+
+       ```bash
+       curl -X POST http://localhost:8080/auth/login \
+         -H "Content-Type: application/json" \
+         -d '{"username":"admin","password":"admin123"}'
+       ```
+
+    2. **Is the `Authorization` header formatted correctly?** It must be `Bearer <token>` with a single space after `Bearer`:
+
+       ```bash
+       curl -H "Authorization: Bearer eyJhbGciOiJIUzM4NCJ9..."
+       ```
+
+    3. **Has the token expired?** Tokens are valid for 1 hour (`expiresIn: 3600`). Re-authenticate to get a fresh token.
+
+    4. **Is the JWT secret consistent?** The same `jwt.secret` value must be set in `auth-service`, `api-gateway`, and `inventory-service`. A mismatch causes signature validation failures.
+
+  </Accordion>
+
+  <Accordion title="No logs appearing in Kibana">
+
+    1. Check that Logstash is running and shows `Pipeline started` in its console output.
+
+    2. Verify Elasticsearch is healthy:
+
+       ```bash
+       curl http://localhost:9200/_cluster/health
+       ```
+
+    3. Wait 1–2 minutes after generating log activity — Elasticsearch indexes asynchronously.
+
+    4. Confirm Logstash can reach the Beats input port:
+
+       ```bash
+       telnet localhost 5044
+       ```
+
+    5. In Kibana, make sure the index pattern `logs-*` is configured under **Management → Stack Management → Index Patterns** with `@timestamp` as the time field.
+
+  </Accordion>
+
+  <Accordion title="Elasticsearch fails to start">
+
+    <Warning>
+      The `docker volume rm` command below permanently deletes all indexed log data. Only run it when you are comfortable losing that data.
+    </Warning>
+
+    1. Inspect the container logs for the root cause:
+
+       ```bash
+       docker logs <elasticsearch-container-id>
+       ```
+
+    2. If the data volume is corrupted, reset it:
+
+       ```bash
+       docker-compose down elasticsearch
+       docker volume rm microservicios_elasticsearch-data
+       docker-compose up elasticsearch -d
+       ```
+
+    3. If memory is too low, reduce the JVM heap in `config/jvm.options`:
+
+       ```text jvm.options
+       -Xms256m
+       -Xmx512m
+       ```
+
+  </Accordion>
+
+  <Accordion title="Logstash cannot connect to Elasticsearch">
+
+    1. Confirm Elasticsearch is healthy before starting Logstash:
+
+       ```bash
+       curl http://localhost:9200/_cluster/health
+       ```
+
+       The response should show `"status":"green"` or `"status":"yellow"`.
+
+    2. Review the output section of your pipeline configuration:
+
+       ```text logstash/pipeline.conf
+       output {
+         elasticsearch {
+           hosts => ["http://localhost:9200"]
+           index => "logs-%{+YYYY.MM.dd}"
+         }
+       }
+       ```
+
+    3. Check whether a firewall or security group is blocking port `9200`.
+
+  </Accordion>
+
+  <Accordion title="Kafka health check fails / topics not available">
+
+    1. List existing topics to verify Kafka is running:
+
+       ```bash
+       docker exec -it <kafka-container> kafka-topics.sh --bootstrap-server localhost:9092 --list
+       ```
+
+    2. The Docker Compose configuration uses **KRaft mode** (`KAFKA_CFG_PROCESS_ROLES: broker,controller`), so no separate Zookeeper container is needed. If you see Zookeeper-related errors, ensure you are using the `bitnami/kafka:latest` image as configured.
+
+    3. Kafka is configured with `KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"`, so topics are created automatically on first use. If a topic is missing, verify the correct Spring profile is active (`kafka`) on both `inventory-service` and `notification-service`.
+
+  </Accordion>
+
+  <Accordion title="High memory usage / OOM (out of memory)">
+
+    Try these steps in order:
+
+    1. **Reduce Elasticsearch heap** in `config/jvm.options`:
+
+       ```text jvm.options
+       -Xms256m
+       -Xmx512m
+       ```
+
+    2. **Skip Zipkin** if you are not actively debugging distributed traces. It can be omitted without affecting core functionality.
+
+    3. **Use RabbitMQ instead of Kafka** — it uses 200–400 MB less RAM:
+
+       ```bash
+       docker compose --profile rabbitmq up --build
+       ```
+
+    4. **Skip ELK entirely** on machines with less than 6 GB of available RAM. The core services (auth, inventory, notification, gateway) function correctly without it.
+
+    See [Memory optimization](/operations/memory-optimization) for a full breakdown.
+
+  </Accordion>
+
+  <Accordion title="Notification service not receiving events">
+
+    1. Verify the message broker is running and healthy:
+
+       ```bash
+       # RabbitMQ
+       curl http://localhost:15672/api/overview -u guest:guest
+
+       # Kafka
+       docker exec -it <kafka-container> kafka-topics.sh --bootstrap-server localhost:9092 --list
+       ```
+
+    2. Confirm both `inventory-service` and `notification-service` are started with the **same** Spring profile:
+
+       ```bash
+       # Both must use the same profile
+       mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+       # or
+       mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+       ```
+
+       Mixing profiles (one service on `rabbitmq`, the other on `kafka`) means they listen to different brokers and events are never delivered.
+
+    3. Check the `inventory-service` logs to confirm the event was published after creating a product:
+
+       ```bash
+       curl -X POST http://localhost:8080/api/inventory/products \
+         -H "Authorization: Bearer $TOKEN" \
+         -H "Content-Type: application/json" \
+         -d '{"name":"Test","quantity":1,"price":9.99}'
+       ```
+
+       You should see a publish confirmation in the inventory-service console before the notification-service can receive anything.
+
+  </Accordion>
+
+</AccordionGroup>

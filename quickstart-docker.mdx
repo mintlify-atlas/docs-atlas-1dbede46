@@ -1,0 +1,201 @@
+---
+title: "Docker quickstart"
+description: "Launch the full microservices ecosystem with Docker Compose in minutes."
+---
+
+## Prerequisites
+
+Before you begin, make sure the following are installed:
+
+- **Java 21**
+- **Maven 3.9+**
+- **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** — must be running before executing any commands (check that the tray icon is not showing "starting...")
+
+## Services and ports
+
+The following services are started by Docker Compose:
+
+| Service | Port | Description |
+|---|---|---|
+| **config-server** | 8888 | Centralized configuration (filesystem) |
+| **eureka-server** | 8761 | Service discovery |
+| **auth-service** | 8083 | Identity service (JWT, BCrypt, H2) |
+| **api-gateway** | 8080 | Spring Cloud Gateway — OAuth2 Resource Server |
+| **inventory-service** | 8082 | Protected inventory microservice (H2) |
+| **notification-service** | 8084 | Event consumer (RabbitMQ or Kafka) |
+| **RabbitMQ** | 5672 / 15672 | Message broker — management UI on 15672 |
+| **Apache Kafka** | 9092 | Message broker (KRaft, no Zookeeper) |
+| **Zipkin** | 9411 | Distributed tracing UI |
+| **Elasticsearch** | 9200 | Log storage and search |
+| **Kibana** | 5601 | Log visualization UI |
+
+<Note>
+  Logstash must be run separately from your local installation. It is not included in Docker Compose.
+</Note>
+
+## Startup sequence
+
+<Steps>
+  <Step title="Build all modules">
+    From the repository root, compile and package all Maven modules (skipping tests for speed):
+
+    ```bash
+    mvn clean package -DskipTests
+    ```
+  </Step>
+
+  <Step title="Choose a message broker and start">
+    Select the broker profile that matches your setup. Docker Compose uses `depends_on` and healthchecks to start services in the correct order automatically.
+
+    <Tabs>
+      <Tab title="RabbitMQ">
+        ```bash
+        docker compose --profile rabbitmq up --build
+        ```
+
+        This starts: RabbitMQ, Zipkin, Elasticsearch, Kibana, config-server, eureka-server, auth-service, api-gateway, inventory-service, and notification-service — all with the `rabbitmq` Spring profile.
+      </Tab>
+      <Tab title="Apache Kafka">
+        ```bash
+        docker compose --profile kafka up --build
+        ```
+
+        This starts: Kafka (KRaft mode, no Zookeeper), Zipkin, Elasticsearch, Kibana, config-server, eureka-server, auth-service, api-gateway, inventory-service, and notification-service — all with the `kafka` Spring profile.
+      </Tab>
+    </Tabs>
+
+    <Tip>
+      Switching brokers requires no code changes — only the profile flag changes.
+    </Tip>
+  </Step>
+
+  <Step title="Wait for all services to become healthy">
+    Docker Compose waits for each service's healthcheck before starting dependents. Startup typically takes 2–3 minutes. You can monitor progress in the terminal output.
+  </Step>
+
+  <Step title="Verify each service">
+    Run the following health check commands to confirm all services are up:
+
+    ```bash
+    # API Gateway
+    curl http://localhost:8080/actuator/health
+
+    # Auth Service
+    curl http://localhost:8083/actuator/health
+
+    # Inventory Service
+    curl http://localhost:8082/actuator/health
+
+    # Notification Service
+    curl http://localhost:8084/actuator/health
+
+    # Eureka — lists all registered services
+    curl http://localhost:8761/eureka/apps
+
+    # Config Server
+    curl http://localhost:8888/actuator/health
+
+    # Zipkin
+    curl http://localhost:9411/api/v2/services
+
+    # Elasticsearch
+    curl http://localhost:9200/_cluster/health
+
+    # Kibana
+    curl http://localhost:5601/api/status
+    ```
+
+    You can also open the following UIs in a browser:
+
+    <CardGroup cols={3}>
+      <Card title="Eureka" href="http://localhost:8761">
+        Service registry dashboard
+      </Card>
+      <Card title="RabbitMQ Management" href="http://localhost:15672">
+        Login: guest / guest
+      </Card>
+      <Card title="Zipkin" href="http://localhost:9411">
+        Distributed tracing UI
+      </Card>
+      <Card title="Kibana" href="http://localhost:5601">
+        Log visualization
+      </Card>
+    </CardGroup>
+  </Step>
+
+  <Step title="Test the API">
+    Get a JWT token, then call the protected inventory endpoint.
+
+    <Tabs>
+      <Tab title="Linux / macOS">
+        ```bash
+        # 1. Obtain a JWT token
+        TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+          -H "Content-Type: application/json" \
+          -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+        # 2. Call the protected inventory endpoint
+        curl -X GET http://localhost:8080/api/inventory/products \
+          -H "Authorization: Bearer $TOKEN"
+        ```
+      </Tab>
+      <Tab title="Windows CMD">
+        ```cmd
+        :: 1. Obtain a JWT token (copy it from the response)
+        curl -X POST http://localhost:8080/auth/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+
+        :: 2. Call the protected endpoint (replace TOKEN_HERE with your token)
+        curl -X GET http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE"
+        ```
+      </Tab>
+      <Tab title="Windows PowerShell">
+        ```powershell
+        # 1. Obtain a JWT token
+        $response = Invoke-RestMethod -Uri "http://localhost:8080/auth/login" -Method POST -ContentType "application/json" -Body '{"username":"admin","password":"admin123"}'
+        $token = $response.token
+
+        # 2. Call the protected inventory endpoint
+        Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" -Headers @{ Authorization = "Bearer $token" }
+        ```
+      </Tab>
+    </Tabs>
+
+    The login endpoint returns:
+
+    ```json
+    {
+      "token": "eyJhbGciOiJIUzM4NCJ9...",
+      "type": "Bearer",
+      "expiresIn": 3600
+    }
+    ```
+
+    **Test users:**
+
+    | Username | Password | Roles |
+    |---|---|---|
+    | `admin` | `admin123` | ADMIN, USER |
+    | `user` | `user123` | USER |
+  </Step>
+
+  <Step title="Stop the services">
+    Press `Ctrl+C` in the terminal where Docker Compose is running to stop the containers, then remove them along with the created network:
+
+    <Tabs>
+      <Tab title="RabbitMQ profile">
+        ```bash
+        docker compose --profile rabbitmq down
+        ```
+      </Tab>
+      <Tab title="Kafka profile">
+        ```bash
+        docker compose --profile kafka down
+        ```
+      </Tab>
+    </Tabs>
+
+    <Note>
+      `Ctrl+C` stops the containers. `docker compose down` additionally removes the containers and the network. Your Elasticsearch data volume (`elasticsearch-data`) is preserved unless you add `-v`.
+    </Note>
+  </Step>
+</Steps>

@@ -1,0 +1,121 @@
+---
+title: 'Distributed tracing with Zipkin'
+description: 'How Micrometer Tracing + Brave + Zipkin provide end-to-end request tracing across all microservices.'
+---
+
+In a microservices architecture, a single client request can span multiple services. Without tracing, correlating what happened across `api-gateway`, `inventory-service`, and `notification-service` requires manually matching timestamps across separate log streams. Distributed tracing solves this by assigning a shared `traceId` to the entire request and a unique `spanId` to each service's work unit.
+
+## Stack
+
+| Component | Role |
+|-----------|------|
+| **Micrometer Tracing** | Tracing API for Spring Boot 3.x (replaces Spring Cloud Sleuth) |
+| **Brave** (`micrometer-tracing-bridge-brave`) | Bridge implementation that connects Micrometer to Zipkin's wire format |
+| **Zipkin Reporter** (`zipkin-reporter-brave`) | Sends completed spans to the Zipkin server over HTTP |
+| **Zipkin Server** | Collects, stores, and visualizes traces — UI at `http://localhost:9411` |
+
+## Maven dependencies
+
+Add both dependencies to each service's `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-brave</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.zipkin.reporter2</groupId>
+    <artifactId>zipkin-reporter-brave</artifactId>
+</dependency>
+```
+
+## YAML configuration
+
+Apply this configuration in each service's `application.yml`:
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+logging:
+  pattern:
+    correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}] "
+```
+
+<Note>
+  `probability: 1.0` traces 100% of requests. In production, lower this to `0.1` (10%) or less to avoid performance overhead.
+</Note>
+
+When running in Docker, override the Zipkin endpoint via an environment variable so services reach the container by hostname:
+
+```yaml
+MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+## Services participating in tracing
+
+| Service | Port | Role in the trace |
+|---------|------|-------------------|
+| `api-gateway` | 8080 | Root span — receives the client request and routes it downstream |
+| `auth-service` | 8083 | Authentication span — validates credentials during login |
+| `inventory-service` | 8082 | Business logic span — handles product CRUD operations |
+| `notification-service` | 8084 | Event consumption span — processes async product-created events |
+
+## Example trace flow
+
+Creating a product with a JWT token generates a trace that looks like this in Zipkin:
+
+```
+[api-gateway]  ────────────────────────────────────────────────
+   │
+   ├── [inventory-service]  ───────────────────────────────────
+   │       │
+   │       └── [notification-service]  ── (async event)
+   │
+   └── total duration: ~120ms
+```
+
+## Log correlation
+
+The `correlation` pattern injects `traceId` and `spanId` into every log line. When you look at service consoles, you can see the same `traceId` appear across all participants:
+
+```
+[api-gateway,6b3e44e01a7d4c00,6b3e44e01a7d4c00] GET /api/inventory/products
+[inventory-service,6b3e44e01a7d4c00,a1b2c3d4e5f60000] Returning 3 products
+```
+
+Both lines share `traceId` `6b3e44e01a7d4c00` but have different `spanId` values, reflecting that each service created its own span within the same trace.
+
+## Using the Zipkin UI
+
+<Steps>
+  <Step title="Open Zipkin">
+    Navigate to `http://localhost:9411` in your browser.
+  </Step>
+  <Step title="Search for traces">
+    Use the search bar to filter by service name, minimum duration, or a specific `traceId`. Select a time range and click **Run Query**.
+  </Step>
+  <Step title="Inspect a trace">
+    Click on any trace result to open the span timeline. Each row is a service; the width of the bar represents the time that service spent processing.
+  </Step>
+  <Step title="Analyze spans">
+    Expand individual spans to see tags, annotations, and timing data. Look for spans with unexpectedly long durations to identify bottlenecks.
+  </Step>
+  <Step title="View service dependencies">
+    Go to **Dependencies** in the top menu to see an auto-generated service topology diagram built from the trace data.
+  </Step>
+</Steps>
+
+## Correlating with Kibana
+
+Zipkin and Kibana complement each other: Zipkin shows the request flow and timing; Kibana shows the detailed log output from each service.
+
+1. In Zipkin, find a request of interest and copy its `traceId` from the trace detail view.
+2. In Kibana (http://localhost:5601), open **Discover** and filter by `traceId:<paste-value>`.
+3. You will see all log lines from every service that participated in that request, in chronological order.
+
+See [ELK stack — centralized logging](/observability/elk-stack) for Kibana setup details.

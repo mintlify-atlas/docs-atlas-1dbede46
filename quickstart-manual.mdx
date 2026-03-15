@@ -1,0 +1,265 @@
+---
+title: "Manual quickstart"
+description: "Run the microservices ecosystem natively without Docker to minimize memory usage."
+---
+
+## When to use this guide
+
+Running services natively without Docker reduces memory consumption significantly:
+
+| Mode | Approximate RAM |
+|---|---|
+| Docker (all services) | ~4–6 GB |
+| Manual (native) | ~1.5–3 GB |
+
+This is useful on machines with 4–8 GB of RAM, or when you want faster JVM startup times without container overhead. It requires more initial setup.
+
+## Prerequisites
+
+- **Java 21**
+- **Maven 3.9+**
+- A message broker (choose one):
+  - **[RabbitMQ](https://www.rabbitmq.com/download.html)** — lighter, recommended. Requires **[Erlang/OTP](https://www.erlang.org/downloads)**.
+  - **[Apache Kafka](https://kafka.apache.org/downloads)** — more complete feature set, higher memory usage.
+- **Zipkin** (optional — for distributed tracing)
+- **Elasticsearch + Kibana** (optional — for centralized log search)
+
+## Memory consumption reference
+
+| Component | RAM | Notes |
+|---|---|---|
+| **RabbitMQ** | 100–200 MB | Lightweight, recommended |
+| **Kafka + Zookeeper** | 400–600 MB | Higher overhead |
+| **Elasticsearch** | 256–512 MB | Configured for development |
+| **Logstash** | 100–200 MB | Lightweight log processing |
+| **Kibana** | 200–400 MB | Web UI |
+| **Zipkin** | 100–200 MB | Optional |
+| **Spring Boot services** | 300–500 MB | 4 services at ~150 MB each |
+| **Total (approximate)** | **1.5–3 GB** | Depending on active components |
+
+<Tip>
+  For 8 GB of total RAM, use RabbitMQ + ELK without Zipkin. For 4 GB, use RabbitMQ with Spring Boot services only.
+</Tip>
+
+## Startup sequence
+
+<Steps>
+  <Step title="Start the message broker">
+    Choose one broker and start it before any Spring Boot service.
+
+    <Tabs>
+      <Tab title="RabbitMQ">
+        If RabbitMQ is installed as a service, start it with:
+
+        ```cmd
+        rabbitmq-server start
+        ```
+
+        Enable the management plugin if you haven't already:
+
+        ```cmd
+        rabbitmq-plugins enable rabbitmq_management
+        ```
+
+        Verify at [http://localhost:15672](http://localhost:15672) (login: `guest` / `guest`).
+      </Tab>
+      <Tab title="Apache Kafka">
+        Start Zookeeper in a dedicated terminal (terminal 1):
+
+        ```cmd
+        cd C:\kafka\kafka_2.13-3.6.0
+        bin\windows\zookeeper-server-start.bat config\zookeeper.properties
+        ```
+
+        Then start Kafka in a second terminal (terminal 2):
+
+        ```cmd
+        cd C:\kafka\kafka_2.13-3.6.0
+        bin\windows\kafka-server-start.bat config\server.properties
+        ```
+
+        Verify Kafka is running:
+
+        ```cmd
+        cd C:\kafka\kafka_2.13-3.6.0
+        bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Start Zipkin (optional)">
+    Zipkin provides distributed tracing. Skip this step if you don't need tracing.
+
+    ```cmd
+    cd C:\zipkin && start-zipkin.bat
+    ```
+
+    Verify at [http://localhost:9411](http://localhost:9411).
+  </Step>
+
+  <Step title="Start the ELK stack (optional)">
+    Elasticsearch, Logstash, and Kibana provide centralized log search. Skip this step if you don't need log aggregation.
+
+    Start each component in a separate terminal:
+
+    ```cmd
+    :: Elasticsearch
+    C:\elasticsearch\bin\elasticsearch.bat
+    ```
+
+    ```cmd
+    :: Logstash — use the pipeline from your project
+    cd "C:\Program Files\logstash-8.17.0"
+    bin\logstash.bat -f "C:\path\to\project\logstash\pipeline.conf"
+    ```
+
+    ```cmd
+    :: Kibana
+    C:\kibana\bin\kibana.bat
+    ```
+
+    Verify:
+    - Elasticsearch: `curl http://localhost:9200/_cluster/health`
+    - Kibana: [http://localhost:5601](http://localhost:5601)
+
+    <Note>
+      Kibana can take 30–60 seconds to fully load on first start.
+    </Note>
+  </Step>
+
+  <Step title="Start the Spring Boot services">
+    Each service must run in its own terminal. Start them **in the order listed below** — later services depend on earlier ones being registered in Eureka.
+
+    <Warning>
+      config-server **must** be started with the `native` profile. Without it, Spring attempts to use the `git` profile by default and fails with `"Invalid config server configuration"` because no Git repository is configured. The `native` profile tells the server to read configuration files from the local `config/` folder.
+    </Warning>
+
+    <Tabs>
+      <Tab title="RabbitMQ">
+        ```bash
+        # Terminal 1 — Config Server (port 8888)
+        cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+
+        # Terminal 2 — Eureka Server (port 8761)
+        cd eureka-server && mvn spring-boot:run
+
+        # Terminal 3 — Auth Service (port 8083)
+        cd auth-service && mvn spring-boot:run
+
+        # Terminal 4 — Inventory Service (port 8082)
+        cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+
+        # Terminal 5 — API Gateway (port 8080) — start after services are registered in Eureka
+        cd api-gateway && mvn spring-boot:run
+
+        # Terminal 6 — Notification Service (port 8084)
+        cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+        ```
+      </Tab>
+      <Tab title="Kafka">
+        ```bash
+        # Terminal 1 — Config Server (port 8888)
+        cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+
+        # Terminal 2 — Eureka Server (port 8761)
+        cd eureka-server && mvn spring-boot:run
+
+        # Terminal 3 — Auth Service (port 8083)
+        cd auth-service && mvn spring-boot:run
+
+        # Terminal 4 — Inventory Service (port 8082)
+        cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+
+        # Terminal 5 — API Gateway (port 8080) — start after services are registered in Eureka
+        cd api-gateway && mvn spring-boot:run
+
+        # Terminal 6 — Notification Service (port 8084)
+        cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Verify all services are running">
+    Run the following commands to confirm everything started correctly:
+
+    ```bash
+    # Eureka — lists all registered services
+    curl http://localhost:8761/eureka/apps
+
+    # API Gateway
+    curl http://localhost:8080/actuator/health
+
+    # Auth Service
+    curl http://localhost:8083/actuator/health
+
+    # Inventory Service
+    curl http://localhost:8082/actuator/health
+
+    # Notification Service
+    curl http://localhost:8084/actuator/health
+    ```
+
+    Verify the broker:
+
+    <Tabs>
+      <Tab title="RabbitMQ">
+        ```bash
+        curl http://localhost:15672/api/overview -u guest:guest
+        ```
+      </Tab>
+      <Tab title="Kafka">
+        ```cmd
+        cd C:\kafka\kafka_2.13-3.6.0
+        bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
+        ```
+      </Tab>
+    </Tabs>
+
+    If ELK is running, verify it too:
+
+    ```bash
+    # Elasticsearch
+    curl http://localhost:9200/_cluster/health
+
+    # Kibana
+    curl http://localhost:5601/api/status
+    ```
+  </Step>
+
+  <Step title="Test the full system">
+    Obtain a JWT token and create a product to exercise the complete request path (gateway → inventory-service → broker → notification-service):
+
+    ```bash
+    # 1. Obtain a JWT token
+    TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+    # 2. Create a product (triggers an async event to notification-service)
+    curl -X POST http://localhost:8080/api/inventory/products \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"name":"Producto Test","quantity":10,"price":99.99}'
+    ```
+
+    Check the notification-service terminal for the event log. With RabbitMQ you will see:
+
+    ```
+    === NOTIFICACIÓN RECIBIDA ===
+    Nuevo producto creado:
+      ID:       4
+      Nombre:   Producto Test
+      ...
+    =============================
+    ```
+
+    **Test users:**
+
+    | Username | Password | Roles |
+    |---|---|---|
+    | `admin` | `admin123` | ADMIN, USER |
+    | `user` | `user123` | USER |
+  </Step>
+</Steps>

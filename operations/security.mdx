@@ -1,0 +1,144 @@
+---
+title: "Security"
+description: "JWT authentication, BCrypt password hashing, and OAuth2 Resource Server configuration across the microservices ecosystem."
+---
+
+## Architecture overview
+
+Authentication is centralised in the auth-service. Every other service that needs to protect resources validates the JWT it receives — either at the gateway level or directly.
+
+```
+Client
+  │
+  │  POST /auth/login
+  ▼
+auth-service  ──── issues signed JWT (HS384) ────►  Client
+
+Client
+  │
+  │  GET /api/inventory/products
+  │  Authorization: Bearer <jwt>
+  ▼
+api-gateway  ──── validates JWT ──── forwards Authorization header ────►  inventory-service
+                                                                               │
+                                                                    validates JWT (OAuth2 RS)
+```
+
+1. **auth-service** — Issues JWTs and hashes passwords with BCrypt.
+2. **api-gateway** — Validates the JWT on every inbound request using WebFlux Security. Forwards the `Authorization` header downstream.
+3. **inventory-service** — Configured as an OAuth2 Resource Server; validates the JWT received from the gateway.
+
+---
+
+## Password hashing
+
+The auth-service hashes all passwords with **BCrypt** via Spring Security's `PasswordEncoder` bean:
+
+```java SecurityConfig.java
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+```
+
+Plain-text passwords are never stored or compared directly. The `passwordEncoder.matches(rawPassword, encodedPassword)` call in `AuthController` handles verification.
+
+---
+
+## JWT configuration
+
+Tokens are signed with **HMAC-SHA384 (HS384)** using the [jjwt](https://github.com/jwtk/jjwt) library. The shared secret and expiry are defined in `application.yml` for each service that needs them:
+
+```yaml application.yml
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+  expiration-ms: 3600000  # 1 hour
+```
+
+<Warning>
+  The default secret is for development only. Change it before any production deployment and never commit secrets to source control. Use an external secrets manager (for example, HashiCorp Vault or AWS Secrets Manager) in production.
+</Warning>
+
+### Services that share the JWT secret
+
+| Service | Role |
+|---------|------|
+| `auth-service` | Signs tokens on login |
+| `api-gateway` | Validates tokens on every request |
+| `inventory-service` | Validates tokens received from the gateway |
+
+All three services must be configured with the **same** secret value. A mismatch causes `401 Unauthorized` responses on protected routes.
+
+---
+
+## API Gateway security
+
+The gateway uses **Spring WebFlux Security** with the Lambda DSL. On each inbound request it:
+
+1. Extracts the `Authorization: Bearer <token>` header.
+2. Validates the JWT signature and expiry using the shared secret.
+3. Rejects the request with `401` if validation fails.
+4. Propagates the original `Authorization` header to the downstream service via a `GatewayFilter`.
+
+Public routes that bypass JWT validation:
+
+| Route | Reason |
+|-------|--------|
+| `POST /auth/login` | Login endpoint — no token yet |
+| `GET /actuator/health` | Health checks |
+
+All `/api/**` routes require a valid JWT.
+
+---
+
+## Inventory service (OAuth2 Resource Server)
+
+The inventory-service is configured as an OAuth2 Resource Server. It independently validates the JWT it receives in the `Authorization` header — it does not trust the gateway's validation result alone.
+
+---
+
+## Auth service security configuration
+
+The auth-service `SecurityFilterChain` permits the following without authentication:
+
+```java SecurityConfig.java
+.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/auth/**", "/h2-console/**", "/actuator/**").permitAll()
+    .anyRequest().authenticated()
+)
+```
+
+This means:
+- `/auth/login` — public
+- `/h2-console/**` — open in development for database inspection
+- `/actuator/**` — health and metrics endpoints
+
+<Note>
+  H2 console access is intentionally open in the development configuration. Restrict or disable it before deploying to any shared or production environment.
+</Note>
+
+`frameOptions` is set to `sameOrigin` to allow the H2 console iframe to load in the browser.
+
+---
+
+## Test users
+
+The `DataInitializer` bean seeds the following accounts on startup:
+
+| Username | Password | Roles |
+|----------|----------|-------|
+| `admin` | `admin123` | `ADMIN`, `USER` |
+| `user` | `user123` | `USER` |
+
+Passwords are stored as BCrypt hashes. These credentials are for development only.
+
+---
+
+## Production checklist
+
+- Replace the JWT secret with a strong, randomly generated value (minimum 256 bits).
+- Store the secret in an external secrets manager — not in `application.yml`.
+- Disable or restrict access to `/h2-console` and switch to a persistent database.
+- Enable TLS on the API Gateway and all service-to-service communication.
+- Lower the Zipkin tracing `probability` from `1.0` to `0.1` (10%) to reduce overhead.
+- Rotate the JWT secret periodically and ensure a zero-downtime rotation strategy.

@@ -1,0 +1,187 @@
+---
+title: 'ELK stack — centralized logging'
+description: 'How Elasticsearch, Logstash, and Kibana aggregate structured logs from all microservices with traceId correlation.'
+---
+
+Zipkin shows how a request flows between services and how long each hop takes. ELK shows what happened inside each service: the full log output, error stack traces, business data, and warnings. Together they give you complete observability over the system.
+
+## Components
+
+| Component | Port | Function |
+|-----------|------|----------|
+| **Elasticsearch** | 9200 | Stores and indexes logs; provides the search API |
+| **Logstash** | 5044 | Receives raw JSON logs from services, parses them, and forwards to Elasticsearch |
+| **Kibana** | 5601 | Web UI for searching, filtering, and visualizing logs |
+
+Elasticsearch and Kibana run in Docker. Logstash runs separately from a local installation.
+
+## Starting Elasticsearch and Kibana
+
+```bash
+# With RabbitMQ profile
+docker compose --profile rabbitmq up elasticsearch kibana -d
+
+# With Kafka profile
+docker compose --profile kafka up elasticsearch kibana -d
+```
+
+Elasticsearch is configured for development: single-node discovery, no TLS, 512 MB JVM heap, and a memory limit of 1 GB. Kibana waits for Elasticsearch to pass its healthcheck before starting.
+
+## Log flow
+
+```
+Spring Boot services
+    │
+    │  JSON logs via TCP (port 5044)
+    │  fields: timestamp, level, logger_name, message, mdc
+    │
+    ▼
+Logstash (localhost:5044)
+    │  pipeline.conf:
+    │  - parses timestamp → @timestamp
+    │  - extracts traceId, spanId, service from MDC
+    │  - drops healthcheck and metrics logs
+    │  - adds environment=development, source=spring-boot
+    │
+    ▼
+Elasticsearch (localhost:9200)
+    │  daily indices: logs-YYYY.MM.dd
+    │
+    ▼
+Kibana (localhost:5601)
+    └── Discover, filters, dashboards
+```
+
+## Logstash pipeline
+
+The pipeline at `logstash/pipeline.conf` does the following:
+
+- **Input:** Accepts JSON lines over TCP on port 5044.
+- **Timestamp parsing:** Converts the `timestamp` field (`yyyy-MM-dd HH:mm:ss.SSS`) to `@timestamp` and removes the original field.
+- **MDC extraction:** If the `mdc` object is present, promotes `traceId`, `spanId`, and `service` to top-level fields for easy filtering in Kibana.
+- **Field cleanup:** Removes `mdc`, `ndc`, `contextMap`, and `contextStack` after extraction.
+- **Noise filtering:** Drops any log where `logger_name` matches `org.springframework.boot.actuate.*` or the message contains `health`, `metrics`, or `prometheus`.
+- **Index routing:** Writes to `logs-YYYY.MM.dd` daily indices in Elasticsearch.
+- **Stdout:** Also prints to stdout using `rubydebug` codec for local debugging.
+
+To start Logstash with this pipeline:
+
+```bash
+cd "C:\Program Files\logstash-8.17.0"
+bin\logstash.bat -f "C:\path\to\project\logstash\pipeline.conf"
+```
+
+Wait until the console prints `Pipeline started` before sending traffic.
+
+## Logback configuration
+
+Each service (`auth-service`, `api-gateway`, `inventory-service`, `notification-service`) includes a `logback-spring.xml` that configures two appenders:
+
+- **CONSOLE** — formatted output with `[service,traceId,spanId]` prefix, used in `default` and `dev` profiles.
+- **LOGSTASH** — `LogstashTcpSocketAppender` sending composite JSON to `localhost:5044`, activated in the `prod` profile.
+
+The JSON encoder sends these fields per log event:
+
+| Field | Source |
+|-------|--------|
+| `timestamp` | Log event time |
+| `level` | Log level (INFO, WARN, ERROR, DEBUG) |
+| `logger_name` | Fully-qualified class name |
+| `message` | Log message |
+| `mdc` | MDC map (includes `traceId`, `spanId`, `service`) |
+| `stack_trace` | Exception stack trace if present |
+
+The `logstash-logback-encoder` Maven dependency must be present in each service:
+
+```xml
+<dependency>
+    <groupId>net.logstash.logback</groupId>
+    <artifactId>logstash-logback-encoder</artifactId>
+</dependency>
+```
+
+## Startup order
+
+<Steps>
+  <Step title="Start Elasticsearch and Kibana">
+    ```bash
+    docker compose --profile rabbitmq up elasticsearch kibana -d
+    ```
+    Wait for Elasticsearch to respond at `http://localhost:9200` before proceeding.
+  </Step>
+  <Step title="Start Logstash">
+    Run Logstash with the project's pipeline configuration. Wait for `Pipeline started` in the console output.
+  </Step>
+  <Step title="Start Spring Boot services">
+    Start `config-server`, `eureka-server`, then the application services. They will begin sending JSON logs to Logstash via TCP on port 5044.
+  </Step>
+</Steps>
+
+## Configuring Kibana
+
+<Steps>
+  <Step title="Open Kibana">
+    Navigate to `http://localhost:5601`.
+  </Step>
+  <Step title="Create an index pattern">
+    Go to **Management → Stack Management → Index Patterns** and click **Create index pattern**.
+  </Step>
+  <Step title="Set the pattern and timestamp">
+    Enter `logs-*` as the index pattern name. Select `@timestamp` as the timestamp field. Click **Create index pattern**.
+  </Step>
+  <Step title="Open Discover">
+    Go to **Discover** in the sidebar and select the `logs-*` index pattern to start browsing logs.
+  </Step>
+</Steps>
+
+## Useful filter fields
+
+| Field | Description | Example values |
+|-------|-------------|----------------|
+| `service` | Originating microservice | `api-gateway`, `auth-service`, `inventory-service`, `notification-service` |
+| `level` | Log severity | `ERROR`, `WARN`, `INFO`, `DEBUG` |
+| `traceId` | Distributed trace identifier — correlates with Zipkin | `6b3e44e01a7d4c00` |
+| `spanId` | Individual span within a trace | `a1b2c3d4e5f60000` |
+| `logger_name` | Class that produced the log | `com.uade.inventory.application.service.ProductService` |
+| `message` | Log message text | Free text |
+
+## Example Kibana queries
+
+```
+# All INFO logs from the API gateway
+service:api-gateway AND level:INFO
+
+# All logs for a specific distributed trace
+traceId:6b3e44e01a7d4c00
+
+# Wildcard traceId prefix search
+traceId:6b3e44e0*
+
+# Find error and exception messages across all services
+message:*error* OR message:*exception*
+
+# Errors from a specific service
+service:inventory-service AND level:ERROR
+```
+
+## Correlating with Zipkin
+
+1. In Zipkin (`http://localhost:9411`), find a trace of interest and copy the `traceId`.
+2. In Kibana Discover, add a filter: `traceId` is `<pasted-value>`.
+3. The results show every log line from every service that participated in that request, ordered by `@timestamp`.
+
+This combination gives you both the timing perspective (Zipkin) and the content perspective (Kibana) for any request.
+
+## Verifying the stack
+
+```bash
+# Check Elasticsearch cluster health
+curl http://localhost:9200/_cluster/health
+
+# Check Kibana status
+curl -f http://localhost:5601/api/status
+
+# Verify Logstash is receiving data (check console for processed events)
+# Or test TCP connectivity
+telnet localhost 5044
+```

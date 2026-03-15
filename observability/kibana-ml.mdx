@@ -1,0 +1,90 @@
+---
+title: 'Kibana Machine Learning'
+description: 'Using Elastic Machine Learning for anomaly detection in microservice logs and metrics.'
+---
+
+Kibana includes **Elastic Machine Learning**, a set of capabilities for automatically detecting unusual patterns in your data. In a microservices project, this means you can move from reactive debugging — checking logs after something breaks — to proactive detection of degrading behavior before it causes an outage.
+
+## What Elastic ML offers
+
+Elastic ML applies unsupervised learning algorithms to time-series data. It learns what "normal" looks like for your indices over time and raises anomalies when values deviate significantly from that baseline. No labeled training data is required.
+
+For a Spring Boot microservices project using the `logs-*` indices created by the ELK stack, practical use cases include:
+
+- **Error rate spikes** — detect when a service generates more `ERROR`-level logs than its historical baseline.
+- **Latency anomalies** — identify unusual response time patterns in application performance logs.
+- **Abnormal request volumes** — surface unexpected drops or surges in request counts by service.
+- **Service degradation prediction** — catch gradual performance decline before it becomes an outage.
+- **Memory leak indicators** — detect steady growth in memory-related log patterns over time.
+
+## License tiers
+
+<Note>
+  Elastic ML features are gated by license tier. Check which tier your deployment uses before planning production monitoring workflows.
+</Note>
+
+| Tier | ML access | Cost |
+|------|-----------|------|
+| **Basic** | Core anomaly detection jobs, single-metric detectors | Free |
+| **Gold / Platinum** | Multi-metric jobs, population analysis, ML-powered alerting, forecasting | Paid subscription |
+| **Enterprise** | Full ML feature set including NLP | Paid subscription |
+
+The Docker Compose configuration in this project sets `xpack.license.self_generated.type: basic`, which is sufficient for learning anomaly detection fundamentals and running single-metric jobs against your `logs-*` indices.
+
+## Accessing Machine Learning
+
+Open Kibana at `http://localhost:5601` and select **Machine Learning** from the left sidebar. If you do not see it, your Kibana version or license may not include it — verify with `curl http://localhost:9200/_license`.
+
+## Creating an anomaly detection job
+
+<Steps>
+  <Step title="Open the anomaly detection section">
+    In Kibana, go to **Machine Learning → Anomaly Detection** and click **Create job**.
+  </Step>
+  <Step title="Select your index">
+    Choose the `logs-*` index pattern. This covers all daily indices created by Logstash.
+  </Step>
+  <Step title="Choose a job type">
+    Select **Single metric** for a straightforward count-based detector (e.g., number of ERROR logs per time bucket). Use **Multi-metric** for more advanced analysis across multiple services simultaneously.
+  </Step>
+  <Step title="Configure the detector">
+    Set the analysis function and field. For error detection, use:
+    - **Function:** `count`
+    - **Split field (optional):** `service` — this creates one model per microservice so each service's normal baseline is learned independently.
+  </Step>
+  <Step title="Set the time range">
+    Provide at least a few hours of historical data so the model has a baseline to learn from. For a fresh development environment, run some traffic first by exercising the API endpoints.
+  </Step>
+  <Step title="Run the job">
+    Give the job a name, review the bucket span (e.g., `15m`), and click **Create job**. Kibana will analyze the historical data and then continue in real time.
+  </Step>
+  <Step title="Review results">
+    Go to **Anomaly Explorer** to see a swimlane view of anomaly scores over time. Click on an anomalous cell to drill down to the specific records and the influencer fields.
+  </Step>
+</Steps>
+
+## Memory optimization for Kibana
+
+If your development machine has limited RAM, add the following settings to Kibana's `config/kibana.yml` to reduce resource consumption:
+
+```yaml
+# Reduce the operations polling interval (less CPU overhead)
+ops.interval: 5000
+
+# Limit the maximum request payload size
+server.maxPayloadBytes: 1048576
+
+# Disable usage telemetry
+telemetry.optIn: false
+```
+
+Kibana uses approximately 200–400 MB of RAM in a basic configuration and requires around 900 MB–1.1 GB of disk space (including the embedded Node.js runtime and frontend libraries).
+
+For Elasticsearch, reduce the JVM heap in `config/jvm.options` if needed:
+
+```
+-Xms256m
+-Xmx512m
+```
+
+The Docker Compose file already sets `ES_JAVA_OPTS: "-Xms512m -Xmx512m"` and a container memory limit of 1 GB for development use.

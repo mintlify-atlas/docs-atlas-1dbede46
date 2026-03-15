@@ -1,0 +1,370 @@
+---
+title: "Hexagonal architecture"
+description: "How the inventory-service implements Ports & Adapters (Hexagonal Architecture) to decouple domain logic from infrastructure."
+---
+
+The `inventory-service` was refactored from a traditional layered architecture to **Hexagonal Architecture** (also called Ports & Adapters). This page explains the problem it solves, the solution applied, and the real code that implements it.
+
+## The problem with traditional layers
+
+In a classic layered architecture, the controller calls the repository directly:
+
+```
+InventoryController  →  ProductRepository (Spring Data JPA)
+```
+
+This structure has several problems:
+
+- The `Product` entity carries JPA annotations (`@Entity`, `@Table`, `@Id`), coupling domain logic to the persistence framework.
+- Business logic lives either in the controller or leaks into the repository layer.
+- Replacing H2 with MongoDB requires modifying both the domain model and the controller.
+- Unit-testing business logic requires mocking JPA infrastructure.
+
+### Structure before the refactor
+
+```
+inventory-service/src/main/java/com/uade/inventory/
+├── InventoryServiceApplication.java
+├── config/
+│   ├── DataInitializer.java
+│   └── SecurityConfig.java
+├── controller/
+│   └── InventoryController.java        ← accesses repository directly
+├── entity/
+│   └── Product.java                    ← JPA entity, domain coupled to @Entity
+└── repository/
+    └── ProductRepository.java          ← Spring Data JPA
+```
+
+## The hexagonal solution
+
+Hexagonal architecture organizes code into three concentric zones:
+
+- **Domain core** — pure Java objects and interfaces; no framework dependencies.
+- **Ports** — interfaces owned by the domain that define what the domain _offers_ (input ports) and what it _needs_ (output ports).
+- **Adapters** — framework-specific implementations that plug into the ports from the outside.
+
+The key rule is the **dependency inversion principle**: the domain defines the interfaces; infrastructure implements them. Nothing in the domain ever imports from infrastructure.
+
+### Structure after the refactor
+
+```
+inventory-service/src/main/java/com/uade/inventory/
+├── InventoryServiceApplication.java
+│
+├── domain/                              ← CORE (no framework dependencies)
+│   ├── model/
+│   │   └── Product.java                ← plain Java object, no @Entity
+│   ├── event/
+│   │   └── ProductCreatedEvent.java    ← domain event
+│   └── port/
+│       ├── in/
+│       │   └── ProductUseCase.java      ← input port (interface)
+│       └── out/
+│           ├── ProductRepositoryPort.java  ← output port (interface)
+│           └── EventPublisherPort.java     ← output port (interface)
+│
+├── application/                         ← USE CASES
+│   └── service/
+│       └── ProductService.java          ← implements ProductUseCase
+│
+└── infrastructure/                      ← ADAPTERS (frameworks, DB, HTTP)
+    ├── adapter/
+    │   ├── in/web/
+    │   │   └── InventoryController.java     ← REST adapter (input)
+    │   └── out/
+    │       ├── persistence/
+    │       │   ├── ProductJpaEntity.java    ← JPA entity (infra only)
+    │       │   ├── ProductJpaRepository.java
+    │       │   ├── ProductPersistenceAdapter.java  ← implements ProductRepositoryPort
+    │       │   └── ProductMapper.java       ← maps domain ↔ JPA
+    │       └── messaging/
+    │           ├── RabbitMQPublisherAdapter.java   ← implements EventPublisherPort
+    │           └── KafkaPublisherAdapter.java      ← implements EventPublisherPort
+    └── config/
+        ├── SecurityConfig.java
+        └── DataInitializer.java
+```
+
+## Domain model
+
+`Product.java` is a plain Java object. It has no `@Entity`, `@Table`, or `@Id` annotations — it knows nothing about JPA or any framework.
+
+```java
+package com.uade.inventory.domain.model;
+
+import java.util.Objects;
+
+public class Product {
+
+    private Long id;
+    private String name;
+    private Integer quantity;
+    private Double price;
+
+    public Product() {
+    }
+
+    public Product(String name, Integer quantity, Double price) {
+        this.name = name;
+        this.quantity = quantity;
+        this.price = price;
+    }
+
+    public Product(Long id, String name, Integer quantity, Double price) {
+        this.id = id;
+        this.name = name;
+        this.quantity = quantity;
+        this.price = price;
+    }
+
+    public Long getId() { return id; }
+    public String getName() { return name; }
+    public Integer getQuantity() { return quantity; }
+    public Double getPrice() { return price; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        Product product = (Product) o;
+        return Objects.equals(id, product.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id);
+    }
+}
+```
+
+## Input port: `ProductUseCase`
+
+The input port is an interface that lives in the domain and declares what operations the application exposes to the outside world.
+
+```java
+package com.uade.inventory.domain.port.in;
+
+import com.uade.inventory.domain.model.Product;
+import java.util.List;
+import java.util.Optional;
+
+public interface ProductUseCase {
+
+    List<Product> getAllProducts();
+
+    Optional<Product> getProductById(Long id);
+
+    Product createProduct(Product product);
+}
+```
+
+The REST controller depends only on this interface — it never imports `ProductService` or any JPA class.
+
+## Output ports
+
+Output ports are interfaces the domain uses to talk to things it needs (a database, a message broker). The domain owns these interfaces; adapters implement them.
+
+### `ProductRepositoryPort`
+
+```java
+package com.uade.inventory.domain.port.out;
+
+import com.uade.inventory.domain.model.Product;
+import java.util.List;
+import java.util.Optional;
+
+public interface ProductRepositoryPort {
+
+    List<Product> findAll();
+
+    Optional<Product> findById(Long id);
+
+    Product save(Product product);
+
+    long count();
+}
+```
+
+### `EventPublisherPort`
+
+```java
+package com.uade.inventory.domain.port.out;
+
+import com.uade.inventory.domain.event.ProductCreatedEvent;
+
+public interface EventPublisherPort {
+
+    void publishProductCreated(ProductCreatedEvent event);
+}
+```
+
+## Application service: `ProductService`
+
+`ProductService` is the only class that contains business logic. It implements `ProductUseCase` and depends on the two output port interfaces — never on Spring Data JPA or RabbitMQ directly.
+
+```java
+package com.uade.inventory.application.service;
+
+import com.uade.inventory.domain.event.ProductCreatedEvent;
+import com.uade.inventory.domain.model.Product;
+import com.uade.inventory.domain.port.in.ProductUseCase;
+import com.uade.inventory.domain.port.out.EventPublisherPort;
+import com.uade.inventory.domain.port.out.ProductRepositoryPort;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Optional;
+
+@Service
+public class ProductService implements ProductUseCase {
+
+    private final ProductRepositoryPort repositoryPort;
+    private final EventPublisherPort eventPublisherPort;
+
+    public ProductService(ProductRepositoryPort repositoryPort, EventPublisherPort eventPublisherPort) {
+        this.repositoryPort = repositoryPort;
+        this.eventPublisherPort = eventPublisherPort;
+    }
+
+    @Override
+    public List<Product> getAllProducts() {
+        return repositoryPort.findAll();
+    }
+
+    @Override
+    public Optional<Product> getProductById(Long id) {
+        return repositoryPort.findById(id);
+    }
+
+    @Override
+    public Product createProduct(Product product) {
+        Product saved = repositoryPort.save(product);
+        eventPublisherPort.publishProductCreated(
+                new ProductCreatedEvent(saved.getId(), saved.getName(), saved.getQuantity(), saved.getPrice())
+        );
+        return saved;
+    }
+}
+```
+
+## Input adapter: `InventoryController`
+
+The REST controller is an infrastructure adapter. It receives HTTP requests and delegates to `ProductUseCase`. Notice it imports only domain types — no JPA, no Spring Data.
+
+```java
+package com.uade.inventory.infrastructure.adapter.in.web;
+
+import com.uade.inventory.domain.model.Product;
+import com.uade.inventory.domain.port.in.ProductUseCase;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/inventory")
+public class InventoryController {
+
+    private final ProductUseCase productUseCase;
+
+    public InventoryController(ProductUseCase productUseCase) {
+        this.productUseCase = productUseCase;
+    }
+
+    @GetMapping("/products")
+    public ResponseEntity<List<Product>> getAllProducts() {
+        return ResponseEntity.ok(productUseCase.getAllProducts());
+    }
+
+    @GetMapping("/products/{id}")
+    public ResponseEntity<Product> getProduct(@PathVariable Long id) {
+        return productUseCase.getProductById(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/products")
+    public ResponseEntity<Product> createProduct(@RequestBody Product product) {
+        return ResponseEntity.ok(productUseCase.createProduct(product));
+    }
+}
+```
+
+## Output adapter: `ProductPersistenceAdapter`
+
+`ProductPersistenceAdapter` implements `ProductRepositoryPort` using Spring Data JPA. The mapper translates between the domain `Product` object and the `ProductJpaEntity` (which carries all the JPA annotations). The domain never sees the JPA entity.
+
+```java
+package com.uade.inventory.infrastructure.adapter.out.persistence;
+
+import com.uade.inventory.domain.model.Product;
+import com.uade.inventory.domain.port.out.ProductRepositoryPort;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Optional;
+
+@Component
+public class ProductPersistenceAdapter implements ProductRepositoryPort {
+
+    private final ProductJpaRepository jpaRepository;
+    private final ProductMapper mapper;
+
+    public ProductPersistenceAdapter(ProductJpaRepository jpaRepository, ProductMapper mapper) {
+        this.jpaRepository = jpaRepository;
+        this.mapper = mapper;
+    }
+
+    @Override
+    public List<Product> findAll() {
+        return jpaRepository.findAll().stream()
+                .map(mapper::toDomain)
+                .toList();
+    }
+
+    @Override
+    public Optional<Product> findById(Long id) {
+        return jpaRepository.findById(id)
+                .map(mapper::toDomain);
+    }
+
+    @Override
+    public Product save(Product product) {
+        ProductJpaEntity saved = jpaRepository.save(mapper.toJpaEntity(product));
+        return mapper.toDomain(saved);
+    }
+
+    @Override
+    public long count() {
+        return jpaRepository.count();
+    }
+}
+```
+
+## Swapping the database
+
+The key payoff of this design: replacing H2/JPA with MongoDB requires writing exactly one new class.
+
+<Steps>
+  <Step title="Write a new adapter">
+    Create `ProductMongoAdapter implements ProductRepositoryPort` using a MongoDB repository. This class lives entirely in `infrastructure/`.
+  </Step>
+  <Step title="Register the bean">
+    Annotate the new adapter with `@Component` (and optionally `@Profile` to activate it conditionally). Spring's dependency injection will provide it wherever `ProductRepositoryPort` is needed.
+  </Step>
+  <Step title="Nothing else changes">
+    `Product.java`, `ProductUseCase`, `ProductService`, `InventoryController`, and `EventPublisherPort` are all untouched. The domain is completely isolated from the infrastructure change.
+  </Step>
+</Steps>
+
+## Principles summary
+
+| Concept | How it is applied |
+| --- | --- |
+| **Pure domain** | `Product.java` is a POJO with no `@Entity` or Spring annotations |
+| **Input port** | `ProductUseCase` defines what operations the domain exposes |
+| **Output port** | `ProductRepositoryPort` and `EventPublisherPort` define what the domain needs |
+| **Input adapter** | `InventoryController` receives HTTP and delegates to the use case |
+| **Output adapter** | `ProductPersistenceAdapter` implements the repository port using JPA |
+| **Mapper** | `ProductMapper` translates between `Product` (domain) and `ProductJpaEntity` (JPA) |
+| **Dependency inversion** | The domain defines interfaces; infrastructure implements them |

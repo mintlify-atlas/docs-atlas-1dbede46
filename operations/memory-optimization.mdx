@@ -1,0 +1,127 @@
+---
+title: "Memory optimization"
+description: "Configuration tips for running the full ecosystem with minimal RAM — useful for development on machines with 4-8GB."
+---
+
+The full ecosystem can be resource-intensive. This page documents the approximate memory footprint of each component and how to reduce it for development.
+
+---
+
+## Memory consumption by component
+
+| Component | RAM | Notes |
+|-----------|-----|-------|
+| RabbitMQ | 100–200 MB | Recommended — lighter than Kafka |
+| Kafka + Zookeeper | 400–600 MB | Heavier option |
+| Elasticsearch | 256–512 MB | Configured for development |
+| Logstash | 100–200 MB | Light processing |
+| Kibana | 200–400 MB RAM / 900 MB–1.1 GB disk | Includes embedded Node.js |
+| Zipkin | 100–200 MB | Optional |
+| Spring Boot services (×4) | 300–500 MB | ~150 MB each |
+| **Total (optimized)** | **1.5–3 GB** | Depends on which components are active |
+
+<Tip>
+  For an 8 GB machine, use RabbitMQ + ELK without Zipkin. For a 4 GB machine, run only RabbitMQ + the four core Spring Boot services and skip ELK entirely.
+</Tip>
+
+---
+
+## Elasticsearch heap reduction
+
+By default the Docker Compose file caps Elasticsearch at 1 GB (`memory: 1g`) and sets the JVM heap to 512 MB:
+
+```yaml docker-compose.yml
+elasticsearch:
+  environment:
+    ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+  deploy:
+    resources:
+      limits:
+        memory: 1g
+```
+
+To reduce this further for development, edit `config/jvm.options` in your Elasticsearch installation:
+
+```text jvm.options
+-Xms256m
+-Xmx512m
+```
+
+Restart Elasticsearch after changing this file.
+
+---
+
+## Kibana memory settings
+
+Kibana's default polling interval and telemetry reporting add unnecessary overhead in development. Add the following to `config/kibana.yml`:
+
+```yaml kibana.yml
+# Reduce operations polling interval (less CPU)
+ops.interval: 5000
+
+# Limit maximum request payload
+server.maxPayloadBytes: 1048576
+
+# Disable usage telemetry
+telemetry.optIn: false
+```
+
+---
+
+## Recommendations by available RAM
+
+### 8 GB total
+
+Run everything except Zipkin:
+
+```bash
+docker compose --profile rabbitmq up --build
+# Zipkin starts automatically but can be excluded:
+# docker compose --profile rabbitmq up config-server eureka-server auth-service api-gateway inventory-service-rabbitmq notification-service-rabbitmq elasticsearch kibana -d
+```
+
+### 4 GB total
+
+Skip ELK and Zipkin entirely. Run only the broker and the four Spring Boot services:
+
+```bash
+# Start RabbitMQ
+rabbitmq-server start
+
+# Start Spring Boot services in separate terminals
+cd config-server  && mvn spring-boot:run -Dspring-boot.run.profiles=native
+cd eureka-server  && mvn spring-boot:run
+cd auth-service   && mvn spring-boot:run
+cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+cd api-gateway    && mvn spring-boot:run
+cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+```
+
+---
+
+## Choosing RabbitMQ over Kafka
+
+RabbitMQ uses 100–200 MB. Kafka with Zookeeper uses 400–600 MB — a difference of 200–400 MB. For development, RabbitMQ is the lighter choice with no loss of functionality. The Spring profile switch is the only change required:
+
+```bash
+# RabbitMQ (lighter)
+docker compose --profile rabbitmq up --build
+
+# Kafka (heavier)
+docker compose --profile kafka up --build
+```
+
+Kafka 3.x in KRaft mode (as configured in `docker-compose.yml`) no longer requires a separate Zookeeper process, which reduces its overhead compared to older Kafka setups.
+
+---
+
+## Skipping optional components
+
+| Component | Required for core functionality | Skip when... |
+|-----------|--------------------------------|---------------|
+| Zipkin | No | Not debugging distributed traces |
+| Elasticsearch | No | Not using centralised log search |
+| Logstash | No | Not using ELK |
+| Kibana | No | Not using ELK |
+
+Core functionality (authentication, inventory CRUD, async notifications) works with only the message broker and the four Spring Boot services.

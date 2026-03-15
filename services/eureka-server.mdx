@@ -1,0 +1,162 @@
+---
+title: "Eureka Server"
+description: "Service discovery server using Netflix Eureka — all microservices register here and discover each other."
+---
+
+The Eureka Server acts as the service registry for the entire ecosystem. Every microservice registers itself with Eureka on startup and queries Eureka to discover the addresses of other services. This enables client-side load balancing (`lb://` URIs in the gateway) without hard-coded hostnames.
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="network-wired">
+    **8761**
+  </Card>
+  <Card title="Dashboard" icon="chart-bar">
+    [localhost:8761](http://localhost:8761)
+  </Card>
+  <Card title="Artifact" icon="cube">
+    `eureka-server`
+  </Card>
+  <Card title="Main class" icon="code">
+    `EurekaServerApplication`
+  </Card>
+</CardGroup>
+
+## Configuration
+
+```yaml application.yml
+server:
+  port: 8761
+
+spring:
+  application:
+    name: eureka-server
+
+eureka:
+  instance:
+    hostname: localhost
+  client:
+    register-with-eureka: false   # Does not register itself
+    fetch-registry: false          # Does not fetch registry from another peer
+    service-url:
+      defaultZone: http://${eureka.instance.hostname}:${server.port}/eureka/
+```
+
+`register-with-eureka: false` and `fetch-registry: false` are standard settings for a standalone (non-clustered) Eureka server — it is the registry, not a client of one.
+
+The `@EnableEurekaServer` annotation in `EurekaServerApplication` activates the server:
+
+```java EurekaServerApplication.java
+@SpringBootApplication
+@EnableEurekaServer
+public class EurekaServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(EurekaServerApplication.class, args);
+    }
+}
+```
+
+## Security
+
+The `SecurityConfig` permits the Eureka registration endpoints and actuator without authentication, while all other routes require authentication:
+
+```java SecurityConfig.java
+http
+    .csrf(AbstractHttpConfigurer::disable)
+    .authorizeHttpRequests(auth -> auth
+        .requestMatchers("/eureka/**", "/actuator/**").permitAll()
+        .anyRequest().authenticated()
+    );
+```
+
+## Starting the service
+
+<Note>
+  Eureka Server must start **after** Config Server (port 8888) is healthy. It fetches its configuration from the config server on startup.
+</Note>
+
+<Steps>
+  <Step title="Navigate to the module directory">
+    ```bash
+    cd eureka-server
+    ```
+  </Step>
+  <Step title="Run the service">
+    ```bash
+    mvn spring-boot:run
+    ```
+
+    No additional profile flag is required.
+  </Step>
+  <Step title="Verify it is healthy">
+    ```bash
+    curl http://localhost:8761/actuator/health
+    ```
+
+    Expected response:
+
+    ```json
+    {"status":"UP"}
+    ```
+  </Step>
+  <Step title="Open the Eureka dashboard">
+    Navigate to [http://localhost:8761](http://localhost:8761) in a browser. Once other services are running, their application names will appear in the **Instances currently registered with Eureka** section.
+  </Step>
+</Steps>
+
+## Docker Compose configuration
+
+```yaml docker-compose.yml
+eureka-server:
+  build:
+    context: .
+    dockerfile: eureka-server/Dockerfile
+  ports:
+    - "8761:8761"
+  environment:
+    EUREKA_INSTANCE_HOSTNAME: eureka-server
+  healthcheck:
+    test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8761/actuator/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 40s
+```
+
+`EUREKA_INSTANCE_HOSTNAME: eureka-server` overrides the default `localhost` hostname so other containers can reach the registry using the Docker Compose service name instead of an IP address.
+
+## How services register
+
+Every client microservice (auth-service, api-gateway, inventory-service, etc.) includes the following in its configuration to point at the registry:
+
+```yaml
+eureka:
+  instance:
+    prefer-ip-address: true
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+```
+
+In Docker Compose this is overridden at runtime:
+
+```yaml
+environment:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+```
+
+## Verifying registered services
+
+Query the Eureka apps endpoint to see all currently registered instances:
+
+```bash
+curl http://localhost:8761/eureka/apps
+```
+
+This returns XML listing every registered application, its instance ID, IP address, port, and health status. When all core services are running you should see entries for `AUTH-SERVICE`, `API-GATEWAY`, `INVENTORY-SERVICE`, and `NOTIFICATION-SERVICE`.
+
+## Startup order
+
+The Eureka Server is the second service to start, immediately after Config Server:
+
+1. Config Server (`port 8888`)
+2. **Eureka Server (`port 8761`)** — this page
+3. Auth Service, API Gateway, and other client services

@@ -1,0 +1,391 @@
+---
+title: "API reference"
+description: "Complete reference for all HTTP endpoints exposed by the microservices ecosystem via the API Gateway."
+---
+
+All requests go through the API Gateway on port `8080`. The gateway validates JWT tokens on every protected route and forwards the `Authorization` header to downstream services.
+
+---
+
+## Auth endpoints
+
+### POST /auth/login
+
+Authenticates a user and returns a signed JWT. No authentication required.
+
+#### Request body
+
+<ParamField body="username" type="string" required>
+  The account username. Must not be blank.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  The account password. Must not be blank.
+</ParamField>
+
+#### Response `200 OK`
+
+<ResponseField name="token" type="string" required>
+  Signed JWT (HS384). Include this value in the `Authorization` header of every subsequent request.
+</ResponseField>
+
+<ResponseField name="type" type="string" required>
+  Token type. Always `"Bearer"`.
+</ResponseField>
+
+<ResponseField name="expiresIn" type="number" required>
+  Token lifetime in seconds. Always `3600` (1 hour).
+</ResponseField>
+
+#### Response `401 Unauthorized`
+
+Returned when the username does not exist or the password does not match.
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+```cmd Windows CMD
+curl -X POST http://localhost:8080/auth/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+```
+
+```powershell Windows PowerShell
+$response = Invoke-RestMethod -Uri "http://localhost:8080/auth/login" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Body '{"username":"admin","password":"admin123"}'
+$response.token
+```
+
+</CodeGroup>
+
+```json Response
+{
+  "token": "eyJhbGciOiJIUzM4NCJ9...",
+  "type": "Bearer",
+  "expiresIn": 3600
+}
+```
+
+---
+
+## Inventory endpoints
+
+All inventory endpoints require a valid Bearer JWT in the `Authorization` header.
+
+<ParamField header="Authorization" type="string" required>
+  `Bearer <token>` — JWT obtained from `POST /auth/login`.
+</ParamField>
+
+### GET /api/inventory/products
+
+Returns all products in the inventory.
+
+#### Response `200 OK`
+
+An array of product objects.
+
+<ResponseField name="[]" type="object[]">
+  <Expandable title="product properties">
+    <ResponseField name="id" type="number" required>
+      Unique product identifier.
+    </ResponseField>
+    <ResponseField name="name" type="string" required>
+      Product name.
+    </ResponseField>
+    <ResponseField name="quantity" type="number" required>
+      Stock quantity.
+    </ResponseField>
+    <ResponseField name="price" type="number" required>
+      Unit price.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<CodeGroup>
+
+```bash Linux / macOS
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+curl -X GET http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```cmd Windows CMD
+curl -X GET http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE"
+```
+
+```powershell Windows PowerShell
+$response = Invoke-RestMethod -Uri "http://localhost:8080/auth/login" `
+  -Method POST -ContentType "application/json" `
+  -Body '{"username":"admin","password":"admin123"}'
+$token = $response.token
+Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" `
+  -Headers @{ Authorization = "Bearer $token" }
+```
+
+</CodeGroup>
+
+```json Response
+[
+  { "id": 1, "name": "Laptop", "quantity": 10, "price": 999.99 },
+  { "id": 2, "name": "Monitor", "quantity": 15, "price": 299.99 }
+]
+```
+
+---
+
+### GET /api/inventory/products/\{id\}
+
+Returns a single product by its numeric ID.
+
+#### Path parameters
+
+<ParamField path="id" type="number" required>
+  The product ID (Long). Example: `1`.
+</ParamField>
+
+#### Response `200 OK`
+
+<ResponseField name="id" type="number" required>
+  Unique product identifier.
+</ResponseField>
+
+<ResponseField name="name" type="string" required>
+  Product name.
+</ResponseField>
+
+<ResponseField name="quantity" type="number" required>
+  Stock quantity.
+</ResponseField>
+
+<ResponseField name="price" type="number" required>
+  Unit price.
+</ResponseField>
+
+#### Response `404 Not Found`
+
+Returned when no product exists with the given ID.
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl -X GET http://localhost:8080/api/inventory/products/1 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```cmd Windows CMD
+curl -X GET http://localhost:8080/api/inventory/products/1 -H "Authorization: Bearer TOKEN_HERE"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products/1" `
+  -Headers @{ Authorization = "Bearer $token" }
+```
+
+</CodeGroup>
+
+```json Response
+{ "id": 1, "name": "Laptop", "quantity": 10, "price": 999.99 }
+```
+
+---
+
+### POST /api/inventory/products
+
+Creates a new product and publishes a `ProductCreatedEvent` to the active message broker (RabbitMQ or Kafka). The notification-service consumes this event asynchronously.
+
+#### Request body
+
+<ParamField body="name" type="string" required>
+  Product name.
+</ParamField>
+
+<ParamField body="quantity" type="number" required>
+  Initial stock quantity.
+</ParamField>
+
+<ParamField body="price" type="number" required>
+  Unit price.
+</ParamField>
+
+#### Response `200 OK`
+
+The created product, including the auto-assigned `id`.
+
+<ResponseField name="id" type="number" required>
+  Auto-generated product ID.
+</ResponseField>
+
+<ResponseField name="name" type="string" required>
+  Product name.
+</ResponseField>
+
+<ResponseField name="quantity" type="number" required>
+  Stock quantity.
+</ResponseField>
+
+<ResponseField name="price" type="number" required>
+  Unit price.
+</ResponseField>
+
+<Note>
+  After this call succeeds, the notification-service logs a confirmation message. Check its console output to verify the event was received.
+</Note>
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Monitor","quantity":15,"price":299.99}'
+```
+
+```cmd Windows CMD
+curl -X POST http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE" -H "Content-Type: application/json" -d "{\"name\":\"Monitor\",\"quantity\":15,\"price\":299.99}"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Headers @{ Authorization = "Bearer $token" } `
+  -Body '{"name":"Monitor","quantity":15,"price":299.99}'
+```
+
+</CodeGroup>
+
+```json Response
+{ "id": 3, "name": "Monitor", "quantity": 15, "price": 299.99 }
+```
+
+---
+
+## Health check endpoints
+
+Health checks are publicly accessible — no authentication required.
+
+| Service | URL |
+|---------|-----|
+| API Gateway | `http://localhost:8080/actuator/health` |
+| Auth Service | `http://localhost:8083/actuator/health` |
+| Inventory Service | `http://localhost:8082/actuator/health` |
+| Notification Service | `http://localhost:8084/actuator/health` |
+| Eureka Server | `http://localhost:8761/actuator/health` |
+| Config Server | `http://localhost:8888/actuator/health` |
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl http://localhost:8080/actuator/health
+```
+
+```cmd Windows CMD
+curl http://localhost:8080/actuator/health
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Uri "http://localhost:8080/actuator/health"
+```
+
+</CodeGroup>
+
+```json Response
+{ "status": "UP" }
+```
+
+---
+
+## End-to-end flow
+
+The following walkthrough demonstrates a complete request lifecycle: authenticate, read inventory, then create a product and observe the async notification event.
+
+<Steps>
+  <Step title="Log in and capture the token">
+    <CodeGroup>
+
+```bash Linux / macOS
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+echo $TOKEN
+```
+
+```cmd Windows CMD
+curl -X POST http://localhost:8080/auth/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+rem Copy the token value from the response and replace TOKEN_HERE in subsequent requests
+```
+
+```powershell Windows PowerShell
+$response = Invoke-RestMethod -Uri "http://localhost:8080/auth/login" `
+  -Method POST -ContentType "application/json" `
+  -Body '{"username":"admin","password":"admin123"}'
+$token = $response.token
+Write-Host $token
+```
+
+    </CodeGroup>
+  </Step>
+
+  <Step title="List all products">
+    <CodeGroup>
+
+```bash Linux / macOS
+curl -X GET http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```cmd Windows CMD
+curl -X GET http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" `
+  -Headers @{ Authorization = "Bearer $token" }
+```
+
+    </CodeGroup>
+  </Step>
+
+  <Step title="Create a product and observe the notification event">
+    <CodeGroup>
+
+```bash Linux / macOS
+curl -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Producto Test","quantity":10,"price":99.99}'
+```
+
+```cmd Windows CMD
+curl -X POST http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE" -H "Content-Type: application/json" -d "{\"name\":\"Producto Test\",\"quantity\":10,\"price\":99.99}"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" `
+  -Method POST -ContentType "application/json" `
+  -Headers @{ Authorization = "Bearer $token" } `
+  -Body '{"name":"Producto Test","quantity":10,"price":99.99}'
+```
+
+    </CodeGroup>
+
+    After the request completes, the notification-service logs the received event. With RabbitMQ active:
+
+    ```text notification-service console
+    === NOTIFICACIÓN RECIBIDA ===
+    Nuevo producto creado:
+      ID:       4
+      Nombre:   Producto Test
+      ...
+    =============================
+    ```
+  </Step>
+</Steps>

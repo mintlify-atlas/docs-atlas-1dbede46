@@ -1,0 +1,159 @@
+---
+title: "Architecture overview"
+description: "How the microservices ecosystem fits together — services, communication patterns, and infrastructure."
+---
+
+This ecosystem is built with Spring Boot 3.4 and Java 21 as a Maven multi-module project. Six application services communicate through an API gateway and exchange domain events asynchronously via a pluggable message broker.
+
+## Service map
+
+```
+                        ┌─────────────────────┐
+                        │    config-server     │
+                        │     (port 8888)      │
+                        │  Centralized config  │
+                        └──────────┬──────────┘
+                                   │  configuration
+                                   ▼
+                        ┌─────────────────────┐
+                        │   eureka-server      │
+                        │     (port 8761)      │
+                        │  Service discovery   │
+                        └──────────┬──────────┘
+                                   │  registration
+                     ┌─────────────┼─────────────┐
+                     ▼             ▼             ▼
+              ┌──────────┐  ┌──────────┐  ┌──────────────┐
+              │auth-svc  │  │inventory │  │notification  │
+              │(8083)    │  │-svc(8082)│  │-svc (8084)   │
+              └──────────┘  └────┬─────┘  └──────┬───────┘
+                     ▲           │  publish       │ consume
+                     │           ▼                │
+              ┌──────────┐  ┌──────────────────────────────┐
+              │api-gateway│  │      Message Broker           │
+              │ (8080)   │  │  RabbitMQ (5672) or           │
+              └──────────┘  │  Apache Kafka (9092)          │
+                     ▲      └──────────────────────────────┘
+                     │
+                  client
+```
+
+## Module table
+
+| Service | Port | Technology | Role |
+| --- | --- | --- | --- |
+| `config-server` | 8888 | Spring Cloud Config (filesystem) | Serves `application.yml` files to all services at startup |
+| `eureka-server` | 8761 | Spring Cloud Netflix Eureka | Service registry — services register and discover each other by name |
+| `auth-service` | 8083 | Spring Security, JWT (HS384), BCrypt, H2 | Issues and validates JWT tokens; owns the user store |
+| `api-gateway` | 8080 | Spring Cloud Gateway, WebFlux, OAuth2 Resource Server | Single entry point; validates JWT on every request and forwards downstream |
+| `inventory-service` | 8082 | Spring Boot, JPA, H2, RabbitMQ or Kafka | CRUD for products; publishes a `ProductCreatedEvent` after every create |
+| `notification-service` | 8084 | Spring Boot, RabbitMQ or Kafka | Consumes product events and logs a notification |
+| RabbitMQ | 5672 / 15672 | RabbitMQ 3, management plugin | Message broker option 1; management UI on port 15672 |
+| Apache Kafka | 9092 | Bitnami Kafka (KRaft, no Zookeeper) | Message broker option 2 |
+| Zipkin | 9411 | OpenZipkin | Distributed tracing UI |
+| Elasticsearch | 9200 | Elasticsearch 8.17 | Log storage and full-text search |
+| Logstash | 5044 | Logstash 8.17 | Receives JSON logs from services over TCP, parses and indexes them |
+| Kibana | 5601 | Kibana 8.17 | Web UI for searching and visualizing logs |
+
+## Request flow
+
+The following describes the end-to-end path of a `POST /api/inventory/products` request:
+
+<Steps>
+  <Step title="Client sends request">
+    The client sends an HTTP request with a `Bearer` token to the API gateway on port 8080.
+  </Step>
+  <Step title="Gateway validates JWT">
+    `api-gateway` acts as an OAuth2 Resource Server. It validates the JWT signature and expiry using the shared secret, then forwards the request — including the `Authorization` header — to `inventory-service` via Eureka service discovery.
+  </Step>
+  <Step title="Inventory service handles business logic">
+    `inventory-service` re-validates the JWT as a Resource Server, then calls `ProductService.createProduct()`. The service saves the product to its H2 database and publishes a `ProductCreatedEvent` to the active message broker.
+  </Step>
+  <Step title="Broker routes the event">
+    The broker (RabbitMQ exchange+queue or Kafka topic `product-created`) routes the event to any bound consumers.
+  </Step>
+  <Step title="Notification service consumes the event">
+    `notification-service` receives the `ProductCreatedEvent` from the broker and logs the notification details.
+  </Step>
+  <Step title="Traces reported to Zipkin">
+    Each service reports spans to Zipkin. All spans share the same `traceId`, allowing the full request chain to be visualized.
+  </Step>
+</Steps>
+
+## Infrastructure components
+
+### Config Server
+
+All services fetch their configuration from `config-server` on startup using the `native` profile, which reads YAML files from the local `config/` directory. Without this, Spring Cloud Config defaults to a Git backend and fails with `Invalid config server configuration`.
+
+### Eureka
+
+Services register themselves at `http://eureka-server:8761/eureka/`. The gateway uses Eureka to resolve downstream service addresses by name, avoiding hard-coded hostnames.
+
+### Zipkin
+
+All services are instrumented with Micrometer Tracing (the Spring Boot 3.x replacement for Spring Cloud Sleuth) using the Brave bridge. Every log line includes `[service-name,traceId,spanId]`. The `traceId` is consistent across all services that participated in a single request, enabling cross-service log correlation.
+
+```
+[api-gateway,6b3e44e01a7d4c00,6b3e44e01a7d4c00] GET /api/inventory/products
+[inventory-service,6b3e44e01a7d4c00,a1b2c3d4e5f60000] Returning 3 products
+```
+
+### ELK stack
+
+Each service ships JSON logs over TCP to Logstash on port 5044, configured via `logback-spring.xml`. Logstash parses the JSON, extracts `traceId`/`spanId` fields, and indexes logs into daily Elasticsearch indices (`logs-YYYY.MM.dd`). Kibana provides the search UI.
+
+| Component | Role |
+| --- | --- |
+| Elasticsearch | Stores and indexes logs; healthchecked before Kibana starts |
+| Logstash | Runs locally; ingests logs from all services via TCP |
+| Kibana | Web UI at `http://localhost:5601`; configure an index pattern `logs-*` to start querying |
+
+## Deployment options
+
+<Tabs>
+  <Tab title="Docker (recommended)">
+    A single `docker compose` command starts all services in dependency order. `depends_on` with healthchecks ensures each service waits for its upstream dependencies.
+
+    ```bash
+    # With RabbitMQ
+    docker compose --profile rabbitmq up --build
+
+    # With Apache Kafka
+    docker compose --profile kafka up --build
+    ```
+
+    **Trade-offs:** Requires ~4–6 GB RAM and Docker Desktop running. No manual installation of brokers or infrastructure tools needed.
+  </Tab>
+  <Tab title="Manual (low memory)">
+    Install each dependency natively (RabbitMQ or Kafka, Zipkin, Elasticsearch, Kibana) and start each Spring Boot service from a separate terminal.
+
+    ```bash
+    # Terminal 1
+    cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+
+    # Terminal 2
+    cd eureka-server && mvn spring-boot:run
+
+    # Terminal 3
+    cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+    ```
+
+    **Trade-offs:** Requires ~1.5–3 GB RAM but demands manual installation and startup of every dependency. Recommended only when Docker is not available.
+  </Tab>
+</Tabs>
+
+## Spring profiles and broker selection
+
+The messaging broker is selected at runtime via a Spring profile. No code changes are required to switch brokers — only the active profile changes.
+
+| Docker command | Spring profile | Broker |
+| --- | --- | --- |
+| `docker compose --profile rabbitmq up --build` | `rabbitmq` | RabbitMQ (exchange + queue) |
+| `docker compose --profile kafka up --build` | `kafka` | Apache Kafka (KRaft, topic `product-created`) |
+
+Both `inventory-service` and `notification-service` must use the same profile. The `docker-compose.yml` defines separate service entries (`inventory-service-rabbitmq`, `inventory-service-kafka`) with `SPRING_PROFILES_ACTIVE` set accordingly, so the correct messaging adapter is activated automatically.
+
+<Info>
+  For manual startup, pass the profile explicitly: `mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq`. See [event-driven architecture](/architecture/event-driven) for how the profile selects a messaging adapter.
+</Info>

@@ -1,0 +1,189 @@
+---
+title: "Auth Service"
+description: "Handles user authentication and JWT token issuance using BCrypt password hashing and HS384 signing."
+---
+
+The Auth Service is the identity service for the ecosystem. It authenticates users against an in-memory H2 database, hashes passwords with BCrypt, and issues signed JWT tokens using the jjwt library with HS384. The issued tokens are subsequently validated by the API Gateway and downstream services.
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="network-wired">
+    **8083**
+  </Card>
+  <Card title="Database" icon="database">
+    H2 in-memory (`authdb`)
+  </Card>
+  <Card title="JWT algorithm" icon="lock">
+    HS384 via jjwt
+  </Card>
+  <Card title="Password hashing" icon="shield">
+    BCrypt
+  </Card>
+</CardGroup>
+
+## Endpoints
+
+### `POST /auth/login`
+
+Authenticates a user and returns a signed JWT token.
+
+**Request body:**
+
+```json
+{
+  "username": "admin",
+  "password": "admin123"
+}
+```
+
+Both fields are validated as `@NotBlank` by the `LoginRequest` record:
+
+```java LoginRequest.java
+public record LoginRequest(
+    @NotBlank(message = "Username is required") String username,
+    @NotBlank(message = "Password is required") String password
+) {}
+```
+
+**Success response (200):**
+
+```json
+{
+  "token": "eyJhbGciOiJIUzM4NCJ9...",
+  "type": "Bearer",
+  "expiresIn": 3600
+}
+```
+
+The response is defined by the `TokenResponse` record:
+
+```java TokenResponse.java
+public record TokenResponse(String token, String type, long expiresIn) {}
+```
+
+**Failure response:** `401 Unauthorized` when credentials do not match.
+
+## JWT configuration
+
+The `JwtService` reads the secret and expiration from `application.yml`:
+
+```yaml application.yml
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+  expiration-ms: 3600000
+```
+
+Tokens are signed with HS384 and include `subject` (username) and a `roles` claim:
+
+```java JwtService.java
+public String generateToken(String username, List<String> roles) {
+    return Jwts.builder()
+        .subject(username)
+        .claim("roles", roles)
+        .issuedAt(new Date())
+        .expiration(new Date(System.currentTimeMillis() + expirationMs))
+        .signWith(secretKey)   // HS384 derived from the secret
+        .compact();
+}
+```
+
+<Warning>
+  The `jwt.secret` value must be identical in **auth-service**, **api-gateway**, and **inventory-service**. If the secrets differ, the gateway will reject tokens issued by the auth service with a 401.
+</Warning>
+
+## Pre-loaded test users
+
+The `DataInitializer` component seeds the H2 database at startup via `CommandLineRunner`:
+
+```java DataInitializer.java
+// Creates roles: USER, ADMIN
+// Creates users:
+User admin = new User("admin", passwordEncoder.encode("admin123"));
+admin.addRole(roleRepository.findByName("ADMIN").orElseThrow());
+admin.addRole(roleRepository.findByName("USER").orElseThrow());
+
+User user = new User("user", passwordEncoder.encode("user123"));
+user.addRole(roleRepository.findByName("USER").orElseThrow());
+```
+
+| Username | Password | Roles |
+|---|---|---|
+| `admin` | `admin123` | `ROLE_ADMIN`, `ROLE_USER` |
+| `user` | `user123` | `ROLE_USER` |
+
+## Security configuration
+
+The `SecurityConfig` permits login, H2 console, and actuator endpoints without authentication. BCrypt is registered as the `PasswordEncoder` bean:
+
+```java SecurityConfig.java
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+
+// Permitted without authentication:
+// /auth/**  /h2-console/**  /actuator/**
+// Frame options set to sameOrigin to allow H2 console in browser.
+```
+
+## H2 console
+
+<Note>
+  The H2 database is **in-memory and isolated** to the auth-service process. It contains only users and roles — it has no visibility into the inventory-service database or any other service's data. The database is reset every time the service restarts.
+</Note>
+
+Access the H2 web console at [http://localhost:8083/h2-console](http://localhost:8083/h2-console).
+
+| Field | Value |
+|---|---|
+| JDBC URL | `jdbc:h2:mem:authdb` |
+| Username | `sa` |
+| Password | *(leave blank)* |
+
+## Login examples
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl -X POST http://localhost:8083/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+```cmd Windows CMD
+curl -X POST http://localhost:8083/auth/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+```
+
+```powershell Windows PowerShell
+$response = Invoke-RestMethod `
+  -Uri "http://localhost:8083/auth/login" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Body '{"username":"admin","password":"admin123"}'
+$response.token
+```
+
+</CodeGroup>
+
+All three commands target the auth-service directly on port 8083. To go through the API Gateway instead, replace `8083` with `8080`.
+
+## Health check
+
+```bash
+curl http://localhost:8083/actuator/health
+```
+
+Expected response:
+
+```json
+{"status":"UP"}
+```
+
+## Starting the service
+
+```bash
+cd auth-service && mvn spring-boot:run
+```
+
+<Tip>
+  Auth Service can start in parallel with API Gateway once both Config Server and Eureka Server are healthy. It does not depend on the gateway or any other application service.
+</Tip>

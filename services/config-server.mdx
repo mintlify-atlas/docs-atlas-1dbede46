@@ -1,0 +1,143 @@
+---
+title: "Config Server"
+description: "Centralized configuration service using Spring Cloud Config with filesystem (native) profile."
+---
+
+The Config Server provides externalized configuration to all microservices in the ecosystem at startup. Every other service fetches its configuration from this server before initializing, which means it **must start first**.
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="network-wired">
+    **8888**
+  </Card>
+  <Card title="Spring profile" icon="tag">
+    `native`
+  </Card>
+  <Card title="Artifact" icon="cube">
+    `config-server`
+  </Card>
+  <Card title="Main class" icon="code">
+    `ConfigServerApplication`
+  </Card>
+</CardGroup>
+
+## Why the `native` profile is required
+
+<Warning>
+  Without the `native` profile, Spring Cloud Config defaults to a **git** backend. On startup it will attempt to clone or access a Git repository and fail with `Invalid config server configuration` if none is configured. The `native` profile tells the server to read configuration files directly from the local `config/` directory instead.
+</Warning>
+
+The `application.yml` sets the search location:
+
+```yaml application.yml
+server:
+  port: 8888
+
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        native:
+          search-locations: file:./config
+      fail-fast: false
+```
+
+The `@EnableConfigServer` annotation in `ConfigServerApplication` activates the server:
+
+```java ConfigServerApplication.java
+@SpringBootApplication
+@EnableConfigServer
+public class ConfigServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ConfigServerApplication.class, args);
+    }
+}
+```
+
+## Security
+
+The `SecurityConfig` class permits all requests to config endpoints, actuator, and encrypt/decrypt routes without authentication — appropriate for a development ecosystem where services on the same network fetch configs at startup:
+
+```java SecurityConfig.java
+.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/actuator/**", "/encrypt/**", "/decrypt/**").permitAll()
+    .requestMatchers("/**").permitAll()
+)
+```
+
+## Starting the service
+
+<Steps>
+  <Step title="Navigate to the module directory">
+    ```bash
+    cd config-server
+    ```
+  </Step>
+  <Step title="Run with the native profile">
+    ```bash
+    mvn spring-boot:run -Dspring-boot.run.profiles=native
+    ```
+
+    The `-Dspring-boot.run.profiles=native` flag activates the `native` profile so the server reads configs from `config/` instead of attempting a Git backend.
+  </Step>
+  <Step title="Verify it is healthy">
+    ```bash
+    curl http://localhost:8888/actuator/health
+    ```
+
+    Expected response:
+
+    ```json
+    {"status":"UP"}
+    ```
+  </Step>
+</Steps>
+
+## Docker Compose configuration
+
+In Docker Compose the profile is passed via an environment variable so no command-line flag is needed:
+
+```yaml docker-compose.yml
+config-server:
+  build:
+    context: .
+    dockerfile: config-server/Dockerfile
+  ports:
+    - "8888:8888"
+  environment:
+    SPRING_PROFILES_ACTIVE: native
+  healthcheck:
+    test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8888/actuator/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 40s
+```
+
+All other services declare `config-server` as a `depends_on` dependency with `condition: service_healthy`, so Docker Compose guarantees the config server is ready before any other service starts.
+
+## How other services connect
+
+Client services locate the config server through the `SPRING_CLOUD_CONFIG_URI` environment variable (or the equivalent `spring.cloud.config.uri` property). When running locally, the default value `http://localhost:8888` is used automatically — no extra configuration is required for local development.
+
+In Docker Compose the variable is resolved via service discovery:
+
+```yaml
+environment:
+  SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+```
+
+## Startup order
+
+<Warning>
+  The Config Server **must be the first Spring Boot service** to start. All other services (Eureka, auth-service, api-gateway, etc.) fetch their configuration from it during bootstrap. If it is not ready, those services will fail to initialize.
+</Warning>
+
+Recommended startup sequence for local (manual) runs:
+
+1. Config Server (`port 8888`) — this page
+2. Eureka Server (`port 8761`)
+3. Auth Service (`port 8083`)
+4. API Gateway (`port 8080`)
+5. Inventory / Notification services

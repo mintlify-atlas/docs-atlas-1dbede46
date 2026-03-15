@@ -1,0 +1,361 @@
+---
+title: "Inventory Service"
+description: "The core business microservice implementing hexagonal architecture with CRUD operations for products and event publishing."
+---
+
+The inventory service manages product inventory and demonstrates hexagonal (ports and adapters) architecture. It exposes a REST API protected by JWT, persists data in an H2 in-memory database, and publishes domain events to a message broker whenever a product is created.
+
+<CardGroup cols={3}>
+  <Card title="Port" icon="plug">
+    `8082`
+  </Card>
+  <Card title="Database" icon="database">
+    H2 in-memory (`inventorydb`)
+  </Card>
+  <Card title="Security" icon="lock">
+    OAuth2 Resource Server (JWT)
+  </Card>
+</CardGroup>
+
+## Architecture overview
+
+The service is structured following hexagonal architecture — the domain core has no dependency on frameworks, databases, or messaging infrastructure. All external concerns are handled by adapters that implement domain-defined ports.
+
+```
+com.uade.inventory/
+├── domain/                        ← Pure domain (no framework dependencies)
+│   ├── model/
+│   │   └── Product.java           ← POJO: id, name, quantity, price
+│   ├── event/
+│   │   └── ProductCreatedEvent.java
+│   └── port/
+│       ├── in/
+│       │   └── ProductUseCase.java          ← Inbound port (interface)
+│       └── out/
+│           ├── ProductRepositoryPort.java   ← Outbound port (interface)
+│           └── EventPublisherPort.java      ← Outbound port (interface)
+│
+├── application/
+│   └── service/
+│       └── ProductService.java     ← Implements ProductUseCase
+│
+└── infrastructure/
+    ├── adapter/
+    │   ├── in/web/
+    │   │   └── InventoryController.java     ← REST adapter
+    │   └── out/persistence/
+    │       └── ProductPersistenceAdapter.java ← JPA adapter
+    └── config/
+        └── DataInitializer.java
+```
+
+### Domain ports
+
+**Inbound port** — `ProductUseCase` defines what operations the domain exposes:
+
+```java ProductUseCase.java
+public interface ProductUseCase {
+    List<Product> getAllProducts();
+    Optional<Product> getProductById(Long id);
+    Product createProduct(Product product);
+}
+```
+
+**Outbound ports** — the domain declares what it needs from infrastructure:
+
+```java ProductRepositoryPort.java
+public interface ProductRepositoryPort {
+    List<Product> findAll();
+    Optional<Product> findById(Long id);
+    Product save(Product product);
+    long count();
+}
+```
+
+```java EventPublisherPort.java
+public interface EventPublisherPort {
+    void publishProductCreated(ProductCreatedEvent event);
+}
+```
+
+The concrete implementations of `EventPublisherPort` live in infrastructure and are activated by Spring profile:
+
+```
+EventPublisherPort
+    ├── RabbitMQPublisherAdapter  → @Profile("rabbitmq")
+    └── KafkaPublisherAdapter     → @Profile("kafka")
+```
+
+## Product model
+
+The `Product` domain object is a plain POJO with no JPA annotations:
+
+```java Product.java
+public class Product {
+    private Long id;
+    private String name;
+    private Integer quantity;
+    private Double price;
+
+    // constructors, getters — no @Entity, no @Table
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `Long` | Auto-generated identifier |
+| `name` | `String` | Product display name |
+| `quantity` | `Integer` | Units in stock |
+| `price` | `Double` | Unit price |
+
+## Spring profiles
+
+The active Spring profile determines which messaging adapter is loaded. The rest of the service — domain, use cases, REST controller, persistence — is unaffected by the profile choice.
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    # Docker
+    docker compose --profile rabbitmq up --build
+
+    # Manual
+    cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+    ```
+
+    Environment variable: `SPRING_PROFILES_ACTIVE=rabbitmq`
+  </Tab>
+  <Tab title="Kafka">
+    ```bash
+    # Docker
+    docker compose --profile kafka up --build
+
+    # Manual
+    cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+    ```
+
+    Environment variable: `SPRING_PROFILES_ACTIVE=kafka`
+  </Tab>
+</Tabs>
+
+## API endpoints
+
+All endpoints require a valid JWT in the `Authorization: Bearer <token>` header. Requests without a token return `401 Unauthorized`.
+
+<Note>
+  In the Docker setup, requests should go through the API Gateway on port `8080`. The inventory service on port `8082` can also be called directly but still requires a valid JWT.
+</Note>
+
+### GET /api/inventory/products
+
+Returns all products in inventory.
+
+<CodeGroup>
+
+```bash With token (via gateway)
+curl -X GET http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```bash Direct access
+curl -X GET http://localhost:8082/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```bash Without token (returns 401)
+curl -X GET http://localhost:8082/api/inventory/products
+```
+
+</CodeGroup>
+
+Example response:
+
+```json
+[
+  { "id": 1, "name": "Laptop",  "quantity": 10, "price": 999.99 },
+  { "id": 2, "name": "Mouse",   "quantity": 50, "price": 29.99  },
+  { "id": 3, "name": "Teclado", "quantity": 30, "price": 79.99  }
+]
+```
+
+### GET /api/inventory/products/{id}
+
+Returns a single product by ID. Returns `404 Not Found` if the product does not exist.
+
+<CodeGroup>
+
+```bash With token (via gateway)
+curl -X GET http://localhost:8080/api/inventory/products/1 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```bash Direct access
+curl -X GET http://localhost:8082/api/inventory/products/1 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+</CodeGroup>
+
+Example response:
+
+```json
+{ "id": 1, "name": "Laptop", "quantity": 10, "price": 999.99 }
+```
+
+### POST /api/inventory/products
+
+Creates a new product. After persisting the product, `ProductService` publishes a `ProductCreatedEvent` via `EventPublisherPort`, which triggers the notification service.
+
+<CodeGroup>
+
+```bash With token (via gateway)
+curl -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Monitor","quantity":15,"price":299.99}'
+```
+
+```bash Direct access
+curl -X POST http://localhost:8082/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Monitor","quantity":15,"price":299.99}'
+```
+
+</CodeGroup>
+
+Example response:
+
+```json
+{ "id": 4, "name": "Monitor", "quantity": 15, "price": 299.99 }
+```
+
+## Event publishing
+
+When `createProduct` is called, `ProductService` saves the product and then publishes a domain event:
+
+```java ProductService.java
+@Override
+public Product createProduct(Product product) {
+    Product saved = repositoryPort.save(product);
+    eventPublisherPort.publishProductCreated(
+            new ProductCreatedEvent(saved.getId(), saved.getName(), saved.getQuantity(), saved.getPrice())
+    );
+    return saved;
+}
+```
+
+The `ProductCreatedEvent` carries:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `productId` | `Long` | ID of the created product |
+| `name` | `String` | Product name |
+| `quantity` | `Integer` | Stock quantity |
+| `price` | `Double` | Unit price |
+| `timestamp` | `Instant` | Set at construction time |
+
+## Obtaining a JWT
+
+All endpoints require a token issued by the auth service. Obtain one before calling inventory endpoints:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+```
+
+Expected login response:
+
+```json
+{
+  "token": "eyJhbGciOiJIUzM4NCJ9...",
+  "type": "Bearer",
+  "expiresIn": 3600
+}
+```
+
+<Tip>
+  Test users: `admin` / `admin123` (roles: ADMIN, USER) and `user` / `user123` (role: USER).
+</Tip>
+
+## JWT validation
+
+The inventory service is configured as an **OAuth2 Resource Server**. It validates the JWT on every incoming request — it does not issue tokens. The same secret key must be configured in `auth-service`, `api-gateway`, and `inventory-service`:
+
+```yaml application.yml
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+```
+
+The API Gateway propagates the `Authorization` header downstream to inventory-service, so the service validates the same token the client originally received.
+
+## Pre-loaded data
+
+On startup, `DataInitializer` seeds the database if it is empty:
+
+```java DataInitializer.java
+@Override
+public void run(String... args) {
+    if (productRepositoryPort.count() == 0) {
+        productRepositoryPort.save(new Product("Laptop",  10, 999.99));
+        productRepositoryPort.save(new Product("Mouse",   50, 29.99));
+        productRepositoryPort.save(new Product("Teclado", 30, 79.99));
+    }
+}
+```
+
+| ID | Name | Quantity | Price |
+|----|------|----------|-------|
+| 1 | Laptop | 10 | $999.99 |
+| 2 | Mouse | 50 | $29.99 |
+| 3 | Teclado | 30 | $79.99 |
+
+## H2 console
+
+The in-memory H2 database can be inspected through the web console:
+
+- **URL**: http://localhost:8082/h2-console
+- **JDBC URL**: `jdbc:h2:mem:inventorydb`
+- **User**: `sa`
+- **Password**: (leave empty)
+
+<Warning>
+  The H2 database is in-memory. All data is lost when the service restarts. Each service instance has its own isolated database — connecting to the inventory H2 console will not show auth-service tables.
+</Warning>
+
+## Environment variables
+
+The following environment variables are set in `docker-compose.yml`:
+
+<Tabs>
+  <Tab title="RabbitMQ profile">
+    | Variable | Value | Description |
+    |----------|-------|-------------|
+    | `SPRING_PROFILES_ACTIVE` | `rabbitmq` | Activates the RabbitMQ messaging adapter |
+    | `SPRING_RABBITMQ_HOST` | `rabbitmq` | Hostname of the RabbitMQ container |
+    | `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` | `http://eureka-server:8761/eureka/` | Service discovery endpoint |
+    | `EUREKA_INSTANCE_PREFER_IP_ADDRESS` | `true` | Registers with IP instead of hostname |
+    | `MANAGEMENT_ZIPKIN_TRACING_ENDPOINT` | `http://zipkin:9411/api/v2/spans` | Distributed tracing endpoint |
+  </Tab>
+  <Tab title="Kafka profile">
+    | Variable | Value | Description |
+    |----------|-------|-------------|
+    | `SPRING_PROFILES_ACTIVE` | `kafka` | Activates the Kafka messaging adapter |
+    | `SPRING_KAFKA_BOOTSTRAP_SERVERS` | `kafka:9092` | Kafka broker address |
+    | `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` | `http://eureka-server:8761/eureka/` | Service discovery endpoint |
+    | `EUREKA_INSTANCE_PREFER_IP_ADDRESS` | `true` | Registers with IP instead of hostname |
+    | `MANAGEMENT_ZIPKIN_TRACING_ENDPOINT` | `http://zipkin:9411/api/v2/spans` | Distributed tracing endpoint |
+  </Tab>
+</Tabs>
+
+## Health check
+
+```bash
+curl http://localhost:8082/actuator/health
+```
+
+Expected response:
+
+```json
+{ "status": "UP" }
+```

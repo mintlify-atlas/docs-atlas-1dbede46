@@ -1,0 +1,239 @@
+---
+title: "API Gateway"
+description: "Spring Cloud Gateway acting as the single entry point — routes requests, validates JWT tokens, and propagates Authorization headers downstream."
+---
+
+The API Gateway is the single entry point for all client traffic. It validates JWT Bearer tokens on every protected request, routes traffic to the appropriate downstream service using Eureka-based load balancing, and explicitly propagates the `Authorization` header so downstream services can perform their own authorization checks.
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="network-wired">
+    **8080**
+  </Card>
+  <Card title="Technology" icon="bolt">
+    Spring Cloud Gateway + WebFlux
+  </Card>
+  <Card title="Auth" icon="shield">
+    OAuth2 Resource Server (JWT/HS384)
+  </Card>
+  <Card title="Main class" icon="code">
+    `ApiGatewayApplication`
+  </Card>
+</CardGroup>
+
+## Configuration
+
+```yaml application.yml
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true
+      routes:
+        - id: auth-service
+          uri: lb://auth-service
+          predicates:
+            - Path=/auth/**
+          filters:
+            - AuthorizationHeader
+        - id: inventory-service
+          uri: lb://inventory-service
+          predicates:
+            - Path=/api/inventory/**
+          filters:
+            - AuthorizationHeader
+
+eureka:
+  instance:
+    prefer-ip-address: true
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+
+management:
+  tracing:
+    sampling:
+      probability: 0.0
+
+logging:
+  pattern:
+    correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}] "
+  level:
+    org.springframework.cloud.gateway: DEBUG
+    org.springframework.security: DEBUG
+    reactor.netty: DEBUG
+```
+
+## Routes
+
+| Route ID | Predicate | Upstream service | Filter |
+|---|---|---|---|
+| `auth-service` | `Path=/auth/**` | `lb://auth-service` | `AuthorizationHeader` |
+| `inventory-service` | `Path=/api/inventory/**` | `lb://inventory-service` | `AuthorizationHeader` |
+
+The `lb://` scheme instructs the gateway to resolve the service address through Eureka and apply client-side load balancing.
+
+## JWT validation
+
+The `SecurityConfig` class configures WebFlux Security as an OAuth2 Resource Server using a symmetric HS384 key:
+
+```java SecurityConfig.java
+@Configuration
+@EnableWebFluxSecurity
+public class SecurityConfig {
+
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+
+    @Bean
+    public ReactiveJwtDecoder reactiveJwtDecoder() {
+        SecretKey key = new SecretKeySpec(
+            jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA384"
+        );
+        return NimbusReactiveJwtDecoder
+            .withSecretKey(key)
+            .macAlgorithm(MacAlgorithm.HS384)
+            .build();
+    }
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        return http
+            .authorizeExchange(exchange -> exchange
+                .pathMatchers("/auth/**").permitAll()        // Login is public
+                .pathMatchers("/actuator/**", "/h2-console/**").permitAll()
+                .anyExchange().authenticated()               // Everything else requires JWT
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt.jwtDecoder(reactiveJwtDecoder()))
+            )
+            .csrf(ServerHttpSecurity.CsrfSpec::disable)
+            .build();
+    }
+}
+```
+
+Requests to `/auth/**` (login) are permitted without a token. All other routes require a valid `Authorization: Bearer <token>` header.
+
+## Authorization header propagation
+
+The `AuthorizationHeaderGatewayFilterFactory` explicitly copies the `Authorization` header onto the mutated downstream request. This ensures the JWT reaches inventory-service and other OAuth2 Resource Servers even when the reactive proxy would otherwise strip it:
+
+```java AuthorizationHeaderGatewayFilterFactory.java
+@Component
+public class AuthorizationHeaderGatewayFilterFactory
+        extends AbstractGatewayFilterFactory<Config> {
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            Optional<String> authHeader = exchange.getRequest()
+                .getHeaders().getOrEmpty(AUTHORIZATION)
+                .stream().findFirst();
+
+            if (authHeader.isPresent()) {
+                ServerHttpRequest mutated = exchange.getRequest().mutate()
+                    .header(AUTHORIZATION, authHeader.get())
+                    .build();
+                return chain.filter(exchange.mutate().request(mutated).build());
+            }
+            return chain.filter(exchange);
+        };
+    }
+}
+```
+
+This filter is referenced in the route definitions as `- AuthorizationHeader`.
+
+## Environment variables
+
+| Variable | Description | Example value |
+|---|---|---|
+| `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` | Eureka registry URL | `http://eureka-server:8761/eureka/` |
+| `MANAGEMENT_ZIPKIN_TRACING_ENDPOINT` | Zipkin span ingestion endpoint | `http://zipkin:9411/api/v2/spans` |
+
+These are set in Docker Compose:
+
+```yaml docker-compose.yml
+api-gateway:
+  environment:
+    EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+    EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+    MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+## Starting the service
+
+<Note>
+  Start the API Gateway **after** Config Server, Eureka Server, and auth-service are healthy. The gateway resolves downstream service addresses from Eureka; if Eureka is not ready, route resolution will fail.
+</Note>
+
+```bash
+cd api-gateway && mvn spring-boot:run
+```
+
+## Health check
+
+```bash
+curl http://localhost:8080/actuator/health
+```
+
+Expected response:
+
+```json
+{"status":"UP"}
+```
+
+## Testing the gateway
+
+### Request without a token returns 401
+
+```bash
+curl -i http://localhost:8080/api/inventory/products
+```
+
+```
+HTTP/1.1 401 Unauthorized
+```
+
+### Request with a valid token is forwarded
+
+<Tabs>
+  <Tab title="Linux / macOS">
+    ```bash
+    TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+    curl http://localhost:8080/api/inventory/products \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+  </Tab>
+  <Tab title="Windows CMD">
+    ```cmd
+    curl -X POST http://localhost:8080/auth/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+    REM Copy the token from the response, then:
+    curl http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE"
+    ```
+  </Tab>
+  <Tab title="Windows PowerShell">
+    ```powershell
+    $response = Invoke-RestMethod -Uri "http://localhost:8080/auth/login" `
+      -Method POST -ContentType "application/json" `
+      -Body '{"username":"admin","password":"admin123"}'
+    $token = $response.token
+
+    Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" `
+      -Headers @{ Authorization = "Bearer $token" }
+    ```
+  </Tab>
+</Tabs>
